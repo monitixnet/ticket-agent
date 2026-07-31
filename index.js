@@ -21,6 +21,11 @@ async function queryDatabaseCache(env, command, key, value = null) {
     const rawText = await response.text();
     console.log(`[UPSTASH DEBUG] Raw payload received for [${command} ${key}]: ${rawText}`);
     
+    // 🛡️ CRITICAL BUG FIX: Only execute JSON parse if the payload contains actual content
+    if (!rawText || rawText.trim() === "") {
+      return null;
+    }
+    
     const data = JSON.parse(rawText);
     return data.result;
   } catch (e) {
@@ -154,7 +159,7 @@ export default {
           console.log("[LOCAL ALERT] Native fetch caught an active bot firewall or redirect wall block!");
           await emitSystemActivityLog(env, locationId, "Firewall intercept triggered. Executing dynamic failover routing...", "MUTATION");
           
-          // 🛡️ PROACTIVE LOCKDOWN: We commit your exact database logic instantly BEFORE initiating the fetch
+          // 🛡️ PROACTIVE LOCKDOWN: Overwrite the database column key to permanent high tier instantly
           await queryDatabaseCache(env, "SET", `ticket_agent:security_tier:${locationId}`, "high");
           console.log("[LOCAL ENGINE] Database configuration successfully auto-healed and locked onto high tier proxies.");
 
