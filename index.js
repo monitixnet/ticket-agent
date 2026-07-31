@@ -21,7 +21,6 @@ async function queryDatabaseCache(env, command, key, value = null) {
     const rawText = await response.text();
     console.log(`[UPSTASH DEBUG] Raw payload received for [${command} ${key}]: ${rawText}`);
     
-    // 🛡️ CRITICAL BUG FIX: Only execute JSON parse if the payload contains actual content
     if (!rawText || rawText.trim() === "") {
       return null;
     }
@@ -136,40 +135,48 @@ export default {
     await emitSystemActivityLog(env, locationId, "Monitoring active - Self-healing data engine online.", "SYSTEM");
 
     let networkPayload;
+    let shouldTriggerFailover = false;
+
     try {
       let currentSecurityTier = await queryDatabaseCache(env, 'GET', `ticket_agent:security_tier:${locationId}`);
       if (!currentSecurityTier) currentSecurityTier = "low";
       console.log(`[LOCAL ENGINE] Active security level read from database cache: ${currentSecurityTier}`);
 
-      networkPayload = await executeSecureFetch(env, config, currentSecurityTier);
-      
-      // AUTO-DETECTION HEURISTICS: Catches hidden server upgrades completely dynamically
-      if (networkPayload.routedVia === "EDGE_NATIVE_FETCH") {
-        const lowerText = (networkPayload.text || "").toLowerCase();
-        const isAccessDenied = networkPayload.status === 403 || 
-                               networkPayload.status === 401 ||
-                               networkPayload.status === 302 ||
-                               networkPayload.status === 301 ||
-                               lowerText.includes("datadome") || 
-                               lowerText.includes("akamai") || 
-                               lowerText.includes("queue-it") ||
-                               lowerText.includes("captcha");
+      try {
+        networkPayload = await executeSecureFetch(env, config, currentSecurityTier);
+        
+        if (networkPayload.routedVia === "EDGE_NATIVE_FETCH") {
+          const lowerText = (networkPayload.text || "").toLowerCase();
+          if (networkPayload.status === 403 || networkPayload.status === 401 || networkPayload.status === 302 || networkPayload.status === 301 || lowerText.includes("datadome") || lowerText.includes("akamai") || lowerText.includes("queue-it") || lowerText.includes("captcha")) {
+            shouldTriggerFailover = true;
+          }
+        }
+      } catch (networkError) {
+        console.log(`[LOCAL ALERT] Native network line encountered an operational exception: ${networkError.message}`);
+        shouldTriggerFailover = true;
+      }
 
-        if (isAccessDenied) {
-          console.log("[LOCAL ALERT] Native fetch caught an active bot firewall or redirect wall block!");
-          await emitSystemActivityLog(env, locationId, "Firewall intercept triggered. Executing dynamic failover routing...", "MUTATION");
-          
-          // 🛡️ PROACTIVE LOCKDOWN: Overwrite the database column key to permanent high tier instantly
+      // =====================================================================
+      // 🛡️ INTERCEPT DOMAIN LOCKDOWN LAYER
+      // =====================================================================
+      if (shouldTriggerFailover) {
+        console.log("[LOCAL ALERT] Redirect wall or network exception detected! Deploying self-healing safeguards...");
+        await emitSystemActivityLog(env, locationId, "Firewall intercept triggered. Executing dynamic failover routing...", "MUTATION");
+        
+        // 🔒 OPTIMIZED CONDITIONAL OVERWRITE: Only execute the database update if it isn't already high
+        if (currentSecurityTier !== "high") {
           await queryDatabaseCache(env, "SET", `ticket_agent:security_tier:${locationId}`, "high");
           console.log("[LOCAL ENGINE] Database configuration successfully auto-healed and locked onto high tier proxies.");
-
-          const targetUrl = encodeURIComponent(config.location_url);
-          const proxyApiUrl = `${env.RESIDENTIAL_PROXY_GATEWAY}?apikey=${env.PROXY_GATEWAY_TOKEN}&url=${targetUrl}&js_render=true&premium_proxy=true`;
-
-          console.log("[LOCAL ENGINE] Rerouting data fetch through premium browser proxy lines...");
-          const failoverRes = await fetch(proxyApiUrl);
-          networkPayload = { text: await failoverRes.text(), status: failoverRes.status, routedVia: "RESIDENTIAL_PROXY_GATEWAY" };
+        } else {
+          console.log("[LOCAL ENGINE] Security tier already confirmed high inside database cache. Skipping redundant update.");
         }
+
+        const targetUrl = encodeURIComponent(config.location_url);
+        const proxyApiUrl = `${env.RESIDENTIAL_PROXY_GATEWAY}?apikey=${env.PROXY_GATEWAY_TOKEN}&url=${targetUrl}&js_render=true&premium_proxy=true`;
+
+        console.log("[LOCAL ENGINE] Rerouting data fetch through premium browser proxy lines...");
+        const failoverRes = await fetch(proxyApiUrl);
+        networkPayload = { text: await failoverRes.text(), status: failoverRes.status, routedVia: "RESIDENTIAL_PROXY_GATEWAY" };
       }
 
     } catch (err) {
