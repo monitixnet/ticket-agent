@@ -63,8 +63,6 @@ async function executeSecureFetch(env, config, currentSecurityTier) {
   if (currentSecurityTier === "high" || config.requires_residential === true || config.security_tier === "high") {
     console.log(`[LOCAL NETWORK] Executing proxy request -> ${config.location_url}`);
     const targetUrl = encodeURIComponent(config.location_url);
-    
-    // WebScrapingAPI / ZenRows premium residential proxy routing parameter structure
     const proxyApiUrl = `${env.RESIDENTIAL_PROXY_GATEWAY}?apikey=${env.PROXY_GATEWAY_TOKEN}&url=${targetUrl}&js_render=true&premium_proxy=true`;
     
     const res = await fetch(proxyApiUrl);
@@ -72,14 +70,12 @@ async function executeSecureFetch(env, config, currentSecurityTier) {
   }
 
   console.log(`[LOCAL NETWORK] Executing free edge fetch -> ${config.location_url}`);
-  
-  // Standard free native line request with max redirect protection limit to prevent lockups
   const res = await fetch(config.location_url, {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-    redirect: "manual" // Intercepts redirect codes instantly without falling into infinite loop loops
+    redirect: "manual"
   });
   
-  return { text: await res.text(), status: res.status, routedVia: "EDGE_NATIVE_FETCH", headers: res.headers };
+  return { text: await res.text(), status: res.status, routedVia: "EDGE_NATIVE_FETCH" };
 }
 
 // =====================================================================
@@ -145,8 +141,6 @@ export default {
       // AUTO-DETECTION HEURISTICS: Catches hidden server upgrades completely dynamically
       if (networkPayload.routedVia === "EDGE_NATIVE_FETCH") {
         const lowerText = (networkPayload.text || "").toLowerCase();
-        
-        // 🌟 REINFORCED WATCHDOG: Detects HTTP redirect states (301/302) or Queue-it signatures instantly
         const isAccessDenied = networkPayload.status === 403 || 
                                networkPayload.status === 401 ||
                                networkPayload.status === 302 ||
@@ -160,16 +154,16 @@ export default {
           console.log("[LOCAL ALERT] Native fetch caught an active bot firewall or redirect wall block!");
           await emitSystemActivityLog(env, locationId, "Firewall intercept triggered. Executing dynamic failover routing...", "MUTATION");
           
+          // 🛡️ PROACTIVE LOCKDOWN: We commit your exact database logic instantly BEFORE initiating the fetch
+          await queryDatabaseCache(env, "SET", `ticket_agent:security_tier:${locationId}`, "high");
+          console.log("[LOCAL ENGINE] Database configuration successfully auto-healed and locked onto high tier proxies.");
+
           const targetUrl = encodeURIComponent(config.location_url);
           const proxyApiUrl = `${env.RESIDENTIAL_PROXY_GATEWAY}?apikey=${env.PROXY_GATEWAY_TOKEN}&url=${targetUrl}&js_render=true&premium_proxy=true`;
 
           console.log("[LOCAL ENGINE] Rerouting data fetch through premium browser proxy lines...");
           const failoverRes = await fetch(proxyApiUrl);
           networkPayload = { text: await failoverRes.text(), status: failoverRes.status, routedVia: "RESIDENTIAL_PROXY_GATEWAY" };
-          
-          // Overwrite the database column key to permanent high routing tier
-          await queryDatabaseCache(env, "SET", `ticket_agent:security_tier:${locationId}`, "high");
-          console.log("[LOCAL ENGINE] Database configuration successfully auto-healed and locked onto high tier proxies.");
         }
       }
 
