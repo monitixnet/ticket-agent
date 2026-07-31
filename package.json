@@ -1,13 +1,26 @@
 {
   "name": "ticket-agent",
-  "version": "0.0.0",
-  "private": true,
+  "version": "1.0.0",
+  "main": "index.js",
   "scripts": {
-    "deploy": "uv run pywrangler deploy",
-    "dev": "uv run pywrangler dev",
-    "start": "uv run pywrangler dev"
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monitixnet/ticket-agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/monitixnet/ticket-agent/issues"
+  },
+  "homepage": "https://github.com/monitixnet/ticket-agent#readme",
+  "description": "",
+  "dependencies": {
+    "playwright-core": "^1.62.1"
   },
   "devDependencies": {
-    "wrangler": "^4.115.0"
+    "wrangler": "^4.118.0"
   }
 }

@@ -1,23 +1,33 @@
-## Usage
+# Ticket Agent
 
-You can run the Worker defined by your new project by executing `wrangler dev` in this
-directory. This will start up an HTTP server and will allow you to iterate on your
-Worker without having to restart `wrangler`.
+## Run Ticket Agent locally
 
-### Types and autocomplete
+Create a .dev.vars file at the root of this project folder.
 
-This project also includes a pyproject.toml with some requirements which
-set up autocomplete and type hints for this Python Workers project.
+Set the required environment variables before starting the app:
 
-To get these installed you'll need `uv`, which you can install by following
-https://docs.astral.sh/uv/getting-started/installation/.
-
-Once `uv` is installed, you can run the following:
-
-```
-uv venv
-uv sync
+```bash
+DATABASE_REST_URL="https://your-upstash-database-link.com"
+DATABASE_REST_TOKEN="your_upstash_secret_token_here"
+RESIDENTIAL_PROXY_GATEWAY="https://scrapingdog.com"
+PROXY_GATEWAY_TOKEN="your_scrapingdog_api_key_here"
+NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 ```
 
-Then point your editor's Python plugin at the `.venv` directory. You should then have working
-autocomplete and type information in your editor.
+## Deploying Ticket Agent
+
+```bash
+npx wrangler deploy
+```
+
+After deployment returns a live confirmation URL, add these five secrets to finish setup:
+
+```bash
+npx wrangler secret put DATABASE_REST_URL
+npx wrangler secret put DATABASE_REST_TOKEN
+npx wrangler secret put RESIDENTIAL_PROXY_GATEWAY
+npx wrangler secret put PROXY_GATEWAY_TOKEN
+npx wrangler secret put NOTIFICATION_OUTBOUND_URL
+```
+
+These variables are required for the app to connect to your Upstash database, proxy gateway, and notification endpoint in both local and deployed environments.
