@@ -62,8 +62,12 @@ jspm_packages/
 !.env.example
 .wrangler/
 
+# local sqlite database dumps
+*.db
+
 # python-specific
 python_modules/
 .venv/
 .venv-workers/
 .DS_Store
+

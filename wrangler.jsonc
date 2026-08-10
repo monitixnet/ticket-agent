@@ -5,10 +5,18 @@
 	"compatibility_date": "2026-07-30",
 	"triggers": {
 		"crons": [
-			"12,32,52 * * * *"
+			"12,32,52 * * * *",
+			"7,17,27,37,47,57 * * * *"
 		]
 	},
 	"observability": {
 		"enabled": true
-	}
+	},
+	"d1_databases": [
+		{
+		"binding": "DB",
+		"database_name": "ticket-agent-db",
+		"database_id": "e7ab586a-98d6-46ad-9e08-8748272573f8"
+		}
+	]
 }
