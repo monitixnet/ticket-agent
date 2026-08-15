@@ -27,7 +27,7 @@ Create a `.dev.vars` file at the root of this project folder and set the require
 
 ```bash
 # Example .dev.vars
-FETCH_PROVIDER_POOL="zenrows"
+FETCH_PROVIDER_POOL="zenrows_browser"
 ZENROWS_API_URL="https://api.zenrows.com/v1/"
 ZENROWS_API_TOKEN="your_zenrows_api_token_here"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."

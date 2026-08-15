@@ -1,10 +1,10 @@
 export const DEFAULT_BUSINESS_HOURS = {
   start: { hour: 7, minute: 30 }, // 7:30 AM
-  end: { hour: 22, minute: 30 }, // 10:30 PM
+  end: { hour: 23, minute: 59 }, // 10:30 PM
 };
 
 const VENUE_MASTER_LIST = [
-  { id: "segerstrom_center", name: "Segerstrom Center for the Arts", stateCode: "CA", timezoneName: "America/Los_Angeles", securityTier: "high", active: true, parseStrategy: "algoliaDiscovery", fetchProvider: "zenrows", algoliaAppId: "900111D3AO", algoliaApiKey: "a256b34d80ad61270c43433595b35948", algoliaIndexName: "scfta-prod-events", settingsApiUrlPattern: "https://seatme.scfta.org/api/settings/performance/{performanceId}", inventoryApiUrlPattern: "https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}", seatInfoApiUrlPattern: "https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId={groupId}&performanceId={performanceId}", priceApiUrlPattern: "https://seatme.scfta.org/api/pricing/performance/{performanceId}", urlPattern: "https://www.scfta.org/shows-events", ticketingUrlPattern: "https://seatme.scfta.org/single\\?id=\\d+", ticketingUrlTemplate: "https://seatme.scfta.org/single?id={performanceId}", ticketingLinkText: "Buy now", performanceIdParam: "id", smokeChecks: ["time_window", "section_parity", "price_parity", "fresh_snapshot", "3x_coverage"] },
+  { id: "segerstrom_center", name: "Segerstrom Center for the Arts", stateCode: "CA", timezoneName: "America/Los_Angeles", securityTier: "high", active: true, discoveryStrategy: "segerstromProductionDiscovery", inventoryStrategy: "segerstromDrillDown", fetchProvider: "zenrows_browser", algoliaAppId: "12REW53NEL", algoliaApiKey: "48f45be4ee8cf2996f1ae593bbd94454", algoliaIndexName: "prod_scfta_calendar", settingsApiUrlPattern: "https://seatme.scfta.org/api/settings/performance/{performanceId}", inventoryApiUrlPattern: "https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}", seatInfoApiUrlPattern: "https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId={groupId}&performanceId={performanceId}", priceApiUrlPattern: "https://seatme.scfta.org/api/pricing/performance/{performanceId}", urlPattern: "https://www.scfta.org/shows-events", buyButtonApiUrl: 'https://www.scfta.org/BuyButton/ButtonById', buyButtonsApiUrl: 'https://www.scfta.org/BuyButton/ButtonsById', ticketingUrlPattern: "https://seatme.scfta.org/single\\?id=\\d+", ticketingUrlTemplate: "https://seatme.scfta.org/single?id={performanceId}", ticketingLinkText: "Buy now", performanceIdParam: "id", smokeChecks: ["time_window", "section_parity", "price_parity", "fresh_snapshot", "3x_coverage"] },
   // { id: "citizen_opera_house", name: "Citizen Opera House", stateCode: "MA", timezoneName: "America/New_York", securityTier: "medium", active: true, parseStrategy: "multiStepApiDiscovery", urlPattern: "https://www.citizenoperahouse.com/events/*", ticketingLinkText: "Buy Tickets", smokeChecks: ["time_window", "section_parity", "price_parity", "fresh_snapshot", "3x_coverage"] },
   // { id: "asu_gammage", name: "ASU Gammage", stateCode: "AZ", timezoneName: "America/Phoenix", securityTier: "medium", active: true, parseStrategy: "singleStep", urlPattern: "https://www.asugammage.com/shows-events", smokeChecks: ["time_window", "section_parity", "price_parity", "fresh_snapshot", "3x_coverage"] },
   // { id: "first_interstate_center_for_the_arts", name: "First Interstate Center for the Arts", stateCode: "WA", timezoneName: "America/Los_Angeles", securityTier: "medium", active: true, parseStrategy: "singleStep", urlPattern: "https://www.firstinterstatecenter.org/events-tickets/calendar", smokeChecks: ["time_window", "section_parity", "price_parity", "fresh_snapshot", "3x_coverage"] },
@@ -54,7 +54,10 @@ function generateActiveVenueAdapters() {
       ticketingLinkText: venue.ticketingLinkText || null,
       ticketingUrlTemplate: venue.ticketingUrlTemplate || null,
       performanceIdParam: venue.performanceIdParam || null,
+      buyButtonApiUrl: venue.buyButtonApiUrl || null,
+      buyButtonsApiUrl: venue.buyButtonsApiUrl || null,
       inventoryApiUrlPattern: venue.inventoryApiUrlPattern || null,
+      settingsApiUrlPattern: venue.settingsApiUrlPattern || null,
       algoliaAppId: venue.algoliaAppId || null,
       algoliaApiKey: venue.algoliaApiKey || null,
       algoliaIndexName: venue.algoliaIndexName || null,
@@ -62,7 +65,8 @@ function generateActiveVenueAdapters() {
       priceApiUrlPattern: venue.priceApiUrlPattern || null,
       requiredInventoryFields: ["section", "row", "seat", "priceLevel", "seatQuality", "eventId"],
       normalizationRules: ["normalize_section_labels", "normalize_row_labels", "normalize_seat_labels", "normalize_price_levels"],
-      parseStrategy: venue.parseStrategy, // This will now be 'algoliaDiscovery' for Segerstrom
+      discoveryStrategy: venue.discoveryStrategy || venue.parseStrategy,
+      inventoryStrategy: venue.inventoryStrategy || venue.parseStrategy,
       smokeChecks: venue.smokeChecks || [],
       listingApprovalAllowed: false,
       monitoringOnly: true,

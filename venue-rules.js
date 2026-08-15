@@ -45,7 +45,7 @@ export function normalizePriceLevel(value = "") {
   if (/^(main|floor|front orchestra)$/.test(raw)) return "main";
   if (/^(premium|vip|club)$/.test(raw)) return "premium";
 
-  return raw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "standard";
+  return raw?.replace(/[^a-z0-9]+/g, "_")?.replace(/^_+|_+$/g, "") || "standard";
 }
 
 export function normalizeSeatQuality(value = "") {
@@ -53,11 +53,11 @@ export function normalizeSeatQuality(value = "") {
   if (!raw) return "standard";
   if (raw.includes("premium") || raw.includes("vip") || raw.includes("club")) return "premium";
   if (raw.includes("standard") || raw.includes("std")) return "standard";
-  return raw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "standard";
+  return raw?.replace(/[^a-z0-9]+/g, "_")?.replace(/^_+|_+$/g, "") || "standard";
 }
 
 export function normalizeLabel(value = "") {
-  return String(value || "").trim().replace(/\s+/g, " ");
+  return String(value || "").trim()?.replace(/\s+/g, " ");
 }
 
 export function normalizeSectionLabel(value = "") {

@@ -60,7 +60,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
         let pageSessionId = null;
         let pageTargetId = null;
         let isSettled = false;
-        const waitTime = _env.ZENROWS_WAIT_TIME || '7373'; // Default wait time of 7 seconds
+        const waitFor = _env.ZENROWS_WAIT_FOR || '.card-wrap'; // Default wait time of 7 seconds
 
         const timeout = setTimeout(() => webSocket.close(1001, 'Timeout'), BROWSER_TIMEOUT);
 
@@ -93,7 +93,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
                 // FIXED & ENHANCED: Injecting a 7-second browser pause inside the DOM 
                 // execution frame before grabbing the hydrated page outerHTML code.
                 cdpSend('Runtime.evaluate', { 
-                    expression: 'new Promise(resolve => setTimeout(() => resolve(document.documentElement.outerHTML), waitTime))',
+                    expression: 'new Promise(resolve => setTimeout(() => resolve(document.documentElement.outerHTML), waitFor))',
                     awaitPromise: true 
                 }, pageSessionId)
                     .then(result => {
@@ -156,41 +156,98 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
     return await cdpPromise;
 }
 
-async function zenrowsProvider(env, targetUrlString) {
-    console.log(`[ZENROWS BROWSER] Routing via ZenRows proxy -> ${targetUrlString}`);
-    const apiUrl = env.ZENROWS_API_URL || 'https://zenrows.com';
+async function zenrowsApiProxyProvider(env, targetUrlString, _targetRow, fetchOptions = {}) {
+    console.log(`[ZENROWS API PROXY] Routing via ZenRows proxy -> ${targetUrlString}`);
+    const apiUrl = env.ZENROWS_API_URL || 'https://api.zenrows.com/v1/';
     const apiToken = env.ZENROWS_API_TOKEN;
-    const waitTime = env.ZENROWS_WAIT_TIME || '7373'; // Default wait time of 7 seconds
     if (!apiToken) {
-        throw new Error('Missing ZENROWS_API_TOKEN environment variable.');
+        throw new Error('Missing ZENROWS_API_TOKEN for zenrowsApiProxyProvider.');
     }
 
-    const params = new URLSearchParams({
+    const zenrowsParams = {
         antibot: 'true',
         apikey: apiToken,
-        block_resources: 'image,font',
-        js_render: 'true',
+        custom_headers: 'true',
         original_status: 'true',
         premium_proxy: 'true',
         proxy_country: 'us',
-        wait: waitTime,
-        url: targetUrlString,
-    });
+        wait: 5000,
+    };
 
-    const cleanBaseUrl = apiUrl.endsWith('/') ? apiUrl.slice(0, -1) : apiUrl;
-    const proxyUrl = `${cleanBaseUrl}?${params.toString()}`;
+    const requestBody = fetchOptions.body;
+    const requestHeaders = fetchOptions.headers || {};
 
-    const res = await fetch(proxyUrl, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+    // ZenRows forwards the request body unchanged.  In particular, do not wrap form
+    // data in JSON: SCFTA's BuyButton endpoint requires URL-encoded form data.
+    const proxyUrlParams = new URLSearchParams({ url: targetUrlString, ...zenrowsParams });
+    const finalZenrowsUrl = `${apiUrl.endsWith('/') ? apiUrl.slice(0, -1) : apiUrl}/?${proxyUrlParams.toString()}`;
+
+    console.log(`[ZENROWS DEBUG] Forwarding ${fetchOptions.method || 'POST'} request with Content-Type: ${requestHeaders['Content-Type'] || 'none'}`);
+
+    const finalZenrowsOptions = {
+        method: fetchOptions.method || 'POST',
+        headers: requestHeaders,
+        body: requestBody,
+    };
+
+    const res = await fetch(finalZenrowsUrl, finalZenrowsOptions);
+    const responseText = await res.text();
+    if (fetchOptions.debug) {
+      console.log(`[ZENROWS DEBUG] Raw response text: ${responseText}`);
+    } else {
+      console.log(`[ZENROWS DEBUG] Raw response text (first 500 chars): ${responseText.slice(0, 500)}`);
+    }
+
+    try {
+        const zenrowsResponse = JSON.parse(responseText);
+
+        let unwrappedText = '';
+        const finalStatus = zenrowsResponse.status_code || res.status;
+
+        // Intelligently detect the response structure.
+        if (zenrowsResponse.data) {
+          // If ZenRows wrapped the response (e.g., for browser rendering), unwrap it.
+          unwrappedText = (typeof zenrowsResponse.data === 'string') ? zenrowsResponse.data : JSON.stringify(zenrowsResponse.data);
+        } else {
+          // Otherwise, the entire response is the payload we want.
+          unwrappedText = JSON.stringify(zenrowsResponse);
         }
+        return { text: unwrappedText, status: finalStatus, routedVia: 'zenrowsApiProxyProvider' };
+    } catch (e) {
+        return {
+            text: responseText,
+            status: res.status,
+            routedVia: 'zenrowsApiProxyProvider'
+        };
+    }
+
+}
+
+async function zenrowsBrowserProvider(env, targetUrlString) {
+    console.log(`[ZENROWS BROWSER] Routing via ZenRows proxy -> ${targetUrlString}`);
+    const apiUrl = env.ZENROWS_API_URL || 'https://api.zenrows.com/v1/';
+    const apiToken = env.ZENROWS_API_TOKEN;
+    if (!apiToken) throw new Error('Missing ZENROWS_API_TOKEN for zenrowsBrowserProvider.');
+
+    const params = new URLSearchParams({
+        apikey: apiToken,
+        url: targetUrlString,
+        js_render: 'true',
+        antibot: 'true',
+        premium_proxy: 'true',
+        proxy_country: 'us',
+        wait: 8000, // Use a generous fixed wait time for API endpoints that have browser-level checks.
     });
-    return { text: await res.text(), status: res.status, routedVia: 'zenrowsProvider' };
+
+    const proxyUrl = `${apiUrl}?${params.toString()}`;
+    const res = await fetch(proxyUrl);
+    return { text: await res.text(), status: res.status, routedVia: 'zenrowsBrowserProvider' };
 }
 
 export const FETCH_PROVIDERS = {
   native: nativeFetchProvider,
-  zenrows: zenrowsProvider,
+  zenrows_browser: zenrowsBrowserProvider,
+  zenrows_api: zenrowsApiProxyProvider,
 };
 
 // Standard Cloudflare Workers entrypoint definition wrapper

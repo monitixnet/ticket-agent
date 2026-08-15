@@ -122,6 +122,30 @@ export async function clearVenueBackoffState(db, venueId) {
     .run();
 }
 
+export async function getDiscoveryJobState(db, jobKey) {
+  const row = await db.prepare('SELECT value_string FROM system_state WHERE key_name = ?')
+    .bind(jobKey)
+    .first();
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value_string);
+  } catch {
+    return null;
+  }
+}
+
+export async function setDiscoveryJobState(db, jobKey, state) {
+  return db.prepare('INSERT OR REPLACE INTO system_state (key_name, value_string) VALUES (?, ?)')
+    .bind(jobKey, JSON.stringify(state))
+    .run();
+}
+
+export async function clearDiscoveryJobState(db, jobKey) {
+  return db.prepare('DELETE FROM system_state WHERE key_name = ?')
+    .bind(jobKey)
+    .run();
+}
+
 export async function getNextPendingScanJob(env, ctx) {
   // In a real environment, this would interact with a queue or durable object.
   // For local dev, we log that this is a no-op. This is not an event worth
@@ -145,6 +169,17 @@ export async function cleanupPastEvents(db) {
   const changed = result.changes ?? 0;
   if (changed > 0) {
     console.log(`[DB] Purged ${changed} past event(s) from the database.`);
+  }
+  return { purged: changed };
+}
+
+export async function cleanupOldWorkerLogs(db) {
+  console.log('[DB] Running cleanup job for old worker logs...');
+  // Purge logs older than 7 days to keep the database size manageable.
+  const result = await db.prepare("DELETE FROM worker_logs WHERE timestamp < datetime('now', '-7 days')").run();
+  const changed = result.changes ?? 0;
+  if (changed > 0) {
+    console.log(`[DB] Purged ${changed} old log(s) from the database.`);
   }
   return { purged: changed };
 }

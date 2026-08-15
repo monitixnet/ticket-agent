@@ -15,6 +15,7 @@ import {
   setVenueBackoffState,
   clearVenueBackoffState,
   cleanupPastEvents,
+  cleanupOldWorkerLogs,
 } from './database/queries.js';
 import { MONITORED_TARGETS, ACTIVE_VENUE_SET } from './venue-config.js';
 import { SCAN_JITTER_CONFIG } from './global-config.js';
@@ -93,6 +94,47 @@ function trackWorkerLog(env, ctx, level, message, context = {}) {
   }
 }
 
+/**
+ * Logs a message and sends a notification, but only if the debug flag is enabled.
+ * @param {object} env - The worker environment.
+ * @param {object} ctx - The execution context.
+ * @param {string} message - The message to log and send.
+ * @param {string} level - The log level ('info', 'warn', 'error').
+ * @param {string} channel - The notification channel ('debug', 'critical').
+*/
+function debugLogAndNotify(env, ctx, message, level = 'info') {
+  if (env.ENABLE_DEBUG_NOTIFICATIONS === 'true') {
+    level === 'warn' ? console.warn(message) : console.log(message);
+    sendTelegramNotification(env, ctx, message);
+  }
+}
+
+
+/**
+ * Sends a message to the configured Telegram notification URL.
+ * This is a "fire-and-forget" operation that does not block execution.
+ * @param {object} env - The worker environment.
+ * @param {object} ctx - The execution context.
+ * @param {string} message - The message to send.
+ * @param {string} channel - The notification channel ('debug' or 'critical').
+ */
+function sendTelegramNotification(env, ctx, message, channel = 'debug') {
+  const url = channel === 'critical'
+    ? env.CRITICAL_NOTIFICATION_OUTBOUND_URL
+    : env.NOTIFICATION_OUTBOUND_URL;
+
+  // Only send if an appropriate URL is configured.
+  if (url) {
+    const promise = fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: `\`\`\`\n${message}\n\`\`\`` }) // Format as a code block for readability
+    }).catch(err => console.error(`[TELEGRAM NOTIFY FAILED] ${err.message}`));
+    // Use waitUntil to allow the fetch to complete in the background.
+    ctx?.waitUntil(promise);
+  }
+}
+
 function isRequestAuthorized(request, env) {
   const expected = env.WEBHOOK_SHARED_SECRET;
   if (!expected) return false;
@@ -100,11 +142,79 @@ function isRequestAuthorized(request, env) {
   return timingSafeEqual(provided, expected);
 }
 
-async function executeSecureFetch(env, targetUrlString, targetRow) {
-  const isHighSecurity = targetRow?.security_tier === 'high';
-  const providerPool = isHighSecurity
-    ? (env.FETCH_PROVIDER_POOL || '').split(',').map(p => p.trim()).filter(Boolean)
-    : ['native']; // Low-security targets use the native fetch.
+async function executeApiFetch(url, options = {}) {
+  const { method = 'GET', headers = {}, body = null, retries = 3, initialBackoff = 2000, debugLog } = options;
+  const defaultHeaders = {
+    'User-Agent': 'Mozilla/5.0 (compatible; TicketAgent/1.0; +https://skybox.com)',
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
+  const finalHeaders = { ...defaultHeaders, ...headers };
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // Add a newline for visual separation in logs between attempts.
+      const attemptMsg = `\n[API FETCH] Attempt ${attempt}/${retries} for -> ${url}`;
+      if (debugLog) debugLog(attemptMsg, 'info');
+
+      if (method === 'POST' && body) {
+        const bodyMsg = `[API FETCH] Request Body: ${body}`;
+        if (debugLog) debugLog(bodyMsg, 'info');
+      }
+      const res = await fetch(url, { method, headers: finalHeaders, body });
+
+      // For transient server errors, we should retry with backoff.
+      if (res.status >= 500 && res.status <= 504) {
+        const backoffMs = initialBackoff * Math.pow(2, attempt - 1) + randomBetween(500, 1500);
+        const errorMsg = `[API FETCH] Received server error (${res.status}). Retrying in ${backoffMs}ms...`;
+        if (debugLog) debugLog(errorMsg, 'warn');
+        if (attempt < retries) await delayExecution(backoffMs);
+        continue; // Move to the next retry attempt
+      }
+
+      // For any other status, we return the result immediately.
+      const responseText = await res.text();
+      const snippet = responseText.slice(0, 400);
+      const responseMsg = responseText.length > 400 ? `[API FETCH] Response Body Snippet: ${snippet}...\n` : `[API FETCH] Response Body: ${snippet}\n`;
+      if (debugLog) debugLog(responseMsg, 'info');
+
+      return { text: responseText, status: res.status, routedVia: 'apiFetchProvider' };
+
+    } catch (err) {
+      console.error(`[API FETCH] Network error on attempt ${attempt}: ${err.message}`);
+      if (attempt < retries) {
+        const backoffMs = initialBackoff * Math.pow(2, attempt - 1) + randomBetween(500, 1500);
+        const retryMsg = `[API FETCH] Retrying after network error in ${backoffMs}ms...`;
+        if (debugLog) debugLog(retryMsg, 'warn');
+        await delayExecution(backoffMs);
+      } else {
+        // If all retries fail, throw the error to be handled by the calling strategy.
+        throw new Error(`API fetch failed for ${url} after ${retries} attempts: ${err.message}`);
+      }
+    }
+  }
+
+  // This part is reached only if all retries resulted in a 5xx error.
+  const errorMessage = `API fetch failed for ${url} after ${retries} attempts due to persistent server errors.`;
+  console.error(`[API FETCH] ${errorMessage}`);
+  return { text: errorMessage, status: 503, routedVia: 'apiFetchProvider' };
+}
+
+async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions = {}) {
+  const method = fetchOptions.method || 'GET';
+  let providerPool = ['native']; // Default to native fetch for low-security targets
+
+  if (targetRow?.security_tier === 'high') {
+    // For high-security targets, intelligently select the provider type.
+    if (method === 'POST') {
+      // API calls use a dedicated, configurable provider pool.
+      // Defaults to the API proxy with a native fetch fallback.
+      providerPool = (env.API_FETCH_PROVIDER_POOL || 'zenrows_api,native').split(',').map(p => p.trim()).filter(Boolean);
+    } else {
+      // Web page scrapes use the browser rendering provider.
+      providerPool = (env.FETCH_PROVIDER_POOL || 'zenrows_browser').split(',').map(p => p.trim()).filter(Boolean);
+    }
+  }
 
   let lastResult = null;
 
@@ -116,7 +226,7 @@ async function executeSecureFetch(env, targetUrlString, targetRow) {
     }
 
     try {
-      const result = await provider(env, targetUrlString, targetRow);
+      const result = await provider(env, targetUrlString, targetRow, fetchOptions);
       lastResult = result;
 
       // If the provider was rate-limited, log it and try the next one in the pool.
@@ -168,40 +278,43 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
       throw new Error(`No valid adapter found for venue ${targetRow.venue_id}.`);
     }
 
-    // For discovery scans, the target URL is the main calendar page.
-    // For inventory monitoring, it's the specific event's direct ticketing URL from the database.
     const isDiscovery = logPrefix === '[DISCOVERY SCAN]';
     const urlToScan = isDiscovery ? adapter.urlPattern : targetRow.event_url;
-      
-    const checkPayload = await executeSecureFetch(env, urlToScan, targetRow);
-    const htmlBody = checkPayload.text || '';
+    const strategyName = isDiscovery ? adapter.discoveryStrategy : adapter.inventoryStrategy;
+    const effectiveStrategy = strategyName ? STRATEGY_REGISTRY[strategyName] : null;
 
-    if (checkPayload.status < 200 || checkPayload.status >= 300) {
-      // Create a snippet for logging purposes only, to avoid logging huge HTML bodies.
-      const bodySnippet = htmlBody.slice(0, 500);
-      console.warn(`${logPrefix} Non-success response (${checkPayload.status}) fetching ${urlToScan} via ${checkPayload.routedVia}.`);
-      await trackWorkerLog(env, ctx, 'warn', 'Non-success response fetching event page', {
-        url: urlToScan,
-        status: checkPayload.status,
-        routedVia: checkPayload.routedVia,
-        bodySnippet
-      });
-    }
-
-    if (isBlockLikeStatus(checkPayload.status)) {
-      const consecutiveBlocks = (backoffState?.consecutiveBlocks || 0) + 1;
-      const policy = resolveVenuePolicy(targetRow.venue_id);
-      const delayMs = computeBackoffDelayMs(consecutiveBlocks, policy);
-      const backoffUntil = new Date(now.getTime() + delayMs).toISOString();
-      await setVenueBackoffState(env.DB, targetRow.venue_id, { consecutiveBlocks, backoffUntil, lastStatus: checkPayload.status });
-      console.warn(`${logPrefix} Received blocking-like response (${checkPayload.status}) for ${targetRow.venue_id}; backing off until ${backoffUntil}.`);
-      await trackWorkerLog(env, ctx, 'warn', 'Venue returned blocking/rate-limit response; backing off', {
+    if (typeof effectiveStrategy !== 'function') {
+      await trackWorkerLog(env, ctx, 'warn', `No valid parse strategy found for venue in the current mode.`, {
         venueId: targetRow.venue_id,
-        status: checkPayload.status,
-        consecutiveBlocks,
-        backoffUntil
+        isDiscovery,
+        strategyName: strategyName || 'not_configured'
       });
       return;
+    }
+
+    let htmlBody = '';
+    // Only perform an initial page fetch if the selected strategy is HTML-based.
+    // API-based strategies will handle their own fetching using executeApiFetch.
+    if (strategyName === 'calendarPageDiscovery' || strategyName === 'singleStep') {
+      const checkPayload = await executeSecureFetch(env, urlToScan, targetRow, { method: 'GET' }); // Initial fetch is always GET
+      htmlBody = checkPayload.text || '';
+
+      if (checkPayload.status < 200 || checkPayload.status >= 300) {
+        const bodySnippet = htmlBody.slice(0, 500);
+        console.warn(`${logPrefix} Non-success response (${checkPayload.status}) fetching ${urlToScan} via ${checkPayload.routedVia}.`);
+        await trackWorkerLog(env, ctx, 'warn', 'Non-success response fetching event page', { url: urlToScan, status: checkPayload.status, routedVia: checkPayload.routedVia, bodySnippet });
+      }
+
+      if (isBlockLikeStatus(checkPayload.status)) {
+        const consecutiveBlocks = (backoffState?.consecutiveBlocks || 0) + 1;
+        const policy = resolveVenuePolicy(targetRow.venue_id);
+        const delayMs = computeBackoffDelayMs(consecutiveBlocks, policy);
+        const backoffUntil = new Date(now.getTime() + delayMs).toISOString();
+        await setVenueBackoffState(env.DB, targetRow.venue_id, { consecutiveBlocks, backoffUntil, lastStatus: checkPayload.status });
+        console.warn(`${logPrefix} Received blocking-like response (${checkPayload.status}) for ${targetRow.venue_id}; backing off until ${backoffUntil}.`);
+        await trackWorkerLog(env, ctx, 'warn', 'Venue returned blocking/rate-limit response; backing off', { venueId: targetRow.venue_id, status: checkPayload.status, consecutiveBlocks, backoffUntil });
+        return;
+      }
     }
 
     if (backoffState?.consecutiveBlocks) {
@@ -219,16 +332,10 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
       return;
     }
 
-    // Begin venue-specific parsing logic
-    const strategyFn = adapter && STRATEGY_REGISTRY[adapter.parseStrategy];
-    if (typeof strategyFn !== 'function') {
-      console.warn(`[PARSER] No parse strategy found for venue: ${targetRow.venue_id}`);
-      return;
-    }
+    const boundDebugLog = (message, level) => debugLogAndNotify(env, ctx, message, level);
+    const boundApiFetch = (url, opts) => executeApiFetch(url, { ...opts, debugLog: boundDebugLog });
 
-    // For discovery, we use the dedicated discovery strategy. Otherwise, we use the venue's configured default.
-    const effectiveStrategy = isDiscovery ? STRATEGY_REGISTRY.calendarPageDiscovery : strategyFn;    
-    const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter);
+    const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, boundApiFetch);
     console.log(`[PARSER] Parser for ${targetRow.venue_id} found ${inventory.length} item(s).`);
 
     if (targetRow.listing_row_id) {
@@ -261,8 +368,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             requiredMinimum: equivalentCoverage.requiredMinimum
           });
 
-          if (env.NOTIFICATION_OUTBOUND_URL) {
-            const rawMsg = `✅ QUALIFYING INVENTORY FOUND (MONITOR ONLY) ✅
+          const notificationMsg = `✅ QUALIFYING INVENTORY FOUND (MONITOR ONLY) ✅
 Venue: ${targetRow.venue_name}
 Show: ${targetRow.show_name}
 Showtime: ${targetRow.showtime}
@@ -271,12 +377,7 @@ Listing ID: ${targetRow.skybox_listing_id}
 Equivalent Inventory: ${equivalentCoverage.equivalentInventoryCount}/${equivalentCoverage.requiredMinimum} (3X buffer met)
 
 Outcome: Seat, price, and confidence buffer all confirmed live. No action taken — outbound listing approval is disabled.`;
-            ctx.waitUntil(fetch(env.NOTIFICATION_OUTBOUND_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ content: rawMsg })
-            }));
-          }
+          sendTelegramNotification(env, ctx, notificationMsg, 'critical');
         }
       }
     }
@@ -377,7 +478,7 @@ async function runScheduledCycle(env, ctx, options = {}) {
 
     // Run the cleanup job for past events during the primary scan cycle.
     if (scheduleMode === 'primary_scan') {
-      await cleanupPastEvents(env.DB);
+      await Promise.all([cleanupPastEvents(env.DB), cleanupOldWorkerLogs(env.DB)]);
     }
 
     await executeScanForTarget(targetRow, env, ctx, {
@@ -546,8 +647,11 @@ export default {
       const currentSnapshotHash = computeStringHash(htmlBody);
 
       const adapter = ACTIVE_VENUE_ADAPTERS[targetRow.venue_id];
-      const strategyFn = adapter && STRATEGY_REGISTRY[adapter.parseStrategy];
-      const inventory = await (strategyFn ? strategyFn(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog) : Promise.resolve([]));
+      const strategyFn = adapter && STRATEGY_REGISTRY[adapter.inventoryStrategy]; // Correctly use inventoryStrategy
+      const boundDebugLog = (message, level) => debugLogAndNotify(env, ctx, message, level);
+      const boundApiFetch = (url, opts) => executeApiFetch(url, { ...opts, debugLog: boundDebugLog });
+
+      const inventory = await (strategyFn ? strategyFn(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, boundApiFetch) : Promise.resolve([]));
       const seatAtLocation = inventory.find(item => isSpecificSeatMatch(item, {
         section: targetRow.section_label,
         row: targetRow.row_label,
@@ -567,8 +671,7 @@ export default {
         await updateListingState(env.DB, targetRow.listing_row_id, "SOLD_OUT", timestampIsoString);
         await updateEventScanResult(env.DB, targetRow.event_id, currentSnapshotHash, timestampIsoString);
 
-        if (env.NOTIFICATION_OUTBOUND_URL) {
-          const rawMsg = `🛑 SPECIFIC SEAT LOCATION EXPOSURE NEUTRALIZED 🛑
+        const notificationMsg = `🛑 SPECIFIC SEAT LOCATION EXPOSURE NEUTRALIZED 🛑
 Venue: ${targetRow.venue_name}
 Show: ${targetRow.show_name}
 Date: ${printableShowtime}
@@ -576,12 +679,7 @@ Target: Section ${targetRow.section_label} | Row ${targetRow.row_label} | ${targ
 Listing ID: ${incomingListingId}
 
 Outcome: Transaction blocked automatically before a ghost sale collision could occur.`;
-          ctx.waitUntil(fetch(env.NOTIFICATION_OUTBOUND_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: rawMsg })
-          }));
-        }
+        sendTelegramNotification(env, ctx, notificationMsg, 'critical');
 
         return new Response(JSON.stringify({ status: 'REJECTED', reason: 'Specific seat location inventory depleted on primary site' }), {
           status: 410,

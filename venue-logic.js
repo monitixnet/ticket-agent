@@ -22,8 +22,8 @@ function findInMap(map, venueIdentifier) {
   const byId = map[input.toLowerCase()];
   if (byId) return byId;
 
-  const normalized = input.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-  return Object.values(map).find(item => item.venueId === normalized || item.venueName.toLowerCase().replace(/[^a-z0-9]+/g, "_") === normalized) || null;
+  const normalized = input.toLowerCase()?.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  return Object.values(map).find(item => item.venueId === normalized || item.venueName.toLowerCase()?.replace(/[^a-z0-9]+/g, "_") === normalized) || null;
 }
 
 export function resolveVenuePolicy(venueIdentifier) {
