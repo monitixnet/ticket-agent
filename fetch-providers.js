@@ -20,7 +20,6 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
         });
 
         if (!profileResponse.ok) {
-            // If our provider is rate-limiting us, this is a transient operational error, not a venue block.
             if (profileResponse.status === 429) {
                 return { text: `Rate limited by ${providerName} provisioning API`, status: 429, routedVia: providerName };
             }
@@ -28,7 +27,6 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
         }
         const profileData = await profileResponse.json();
 
-        // Surfsky uses 'ws_url', others might use 'ws_endpoint' or similar.
         wsEndpoint = profileData.ws_url || profileData.ws_endpoint;
         if (!wsEndpoint) {
             throw new Error('Provisioning response did not contain a ws_url.');
@@ -41,7 +39,6 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
     // 2. Connect to the browser and perform the navigation.
     let webSocket;
     try {
-        // The Cloudflare Workers fetch API requires using https:// for WebSocket upgrades.
         const upgradeUrl = new URL(wsEndpoint);
         upgradeUrl.protocol = 'https';
 
@@ -63,6 +60,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
         let pageSessionId = null;
         let pageTargetId = null;
         let isSettled = false;
+        const waitTime = _env.ZENROWS_WAIT_TIME || '7373'; // Default wait time of 7 seconds
 
         const timeout = setTimeout(() => webSocket.close(1001, 'Timeout'), BROWSER_TIMEOUT);
 
@@ -90,10 +88,17 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
                     resolve(cdpMessage.result);
                 }
             } else if (cdpMessage.method === 'Page.loadEventFired' && cdpMessage.sessionId === pageSessionId) {
-                cdpSend('Runtime.evaluate', { expression: 'document.documentElement.outerHTML' }, pageSessionId)
+                if (isSettled) return;
+
+                // FIXED & ENHANCED: Injecting a 7-second browser pause inside the DOM 
+                // execution frame before grabbing the hydrated page outerHTML code.
+                cdpSend('Runtime.evaluate', { 
+                    expression: 'new Promise(resolve => setTimeout(() => resolve(document.documentElement.outerHTML), waitTime))',
+                    awaitPromise: true 
+                }, pageSessionId)
                     .then(result => {
                         if (isSettled) return;
-                        const pageContent = result.result.value || '';
+                        const pageContent = result.result?.value || '';
                         let finalStatus = 200;
                         if (pageContent.toLowerCase().includes('rate limit') || pageContent.toLowerCase().includes('blocked')) {
                             finalStatus = 429;
@@ -136,9 +141,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
                 const attachResult = await cdpSend('Target.attachToTarget', { targetId: pageTarget.targetId, flatten: true });
                 pageSessionId = attachResult.sessionId;
 
-                // Send an initial command to the new session to "warm it up" and prevent premature closure.
                 await cdpSend('Runtime.getIsolateId', {}, pageSessionId);
-
                 await cdpSend('Page.enable', {}, pageSessionId);
                 await cdpSend('Runtime.enable', {}, pageSessionId);
                 await cdpSend('Page.navigate', { url: targetUrlString }, pageSessionId);
@@ -155,9 +158,9 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
 
 async function zenrowsProvider(env, targetUrlString) {
     console.log(`[ZENROWS BROWSER] Routing via ZenRows proxy -> ${targetUrlString}`);
-    const apiUrl = env.ZENROWS_API_URL || 'https://api.zenrows.com/v1/';
+    const apiUrl = env.ZENROWS_API_URL || 'https://zenrows.com';
     const apiToken = env.ZENROWS_API_TOKEN;
-    const waitTime = env.ZENROWS_WAIT_TIME || '7373';
+    const waitTime = env.ZENROWS_WAIT_TIME || '7373'; // Default wait time of 7 seconds
     if (!apiToken) {
         throw new Error('Missing ZENROWS_API_TOKEN environment variable.');
     }
@@ -173,10 +176,12 @@ async function zenrowsProvider(env, targetUrlString) {
         wait: waitTime,
         url: targetUrlString,
     });
-    const proxyUrl = `${apiUrl}?${params.toString()}`;
+
+    const cleanBaseUrl = apiUrl.endsWith('/') ? apiUrl.slice(0, -1) : apiUrl;
+    const proxyUrl = `${cleanBaseUrl}?${params.toString()}`;
+
     const res = await fetch(proxyUrl, {
         headers: {
-            // Sending a realistic User-Agent is crucial for many sites.
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
         }
     });
@@ -186,4 +191,43 @@ async function zenrowsProvider(env, targetUrlString) {
 export const FETCH_PROVIDERS = {
   native: nativeFetchProvider,
   zenrows: zenrowsProvider,
+};
+
+// Standard Cloudflare Workers entrypoint definition wrapper
+export default {
+    async fetch(request, env) {
+        try {
+            const url = new URL(request.url);
+            const targetUrl = url.searchParams.get("target");
+            const provider = url.searchParams.get("provider") || "native";
+
+            if (!targetUrl) {
+                return new Response(JSON.stringify({ error: "Missing '?target=' query parameter." }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+
+            if (!FETCH_PROVIDERS[provider]) {
+                return new Response(JSON.stringify({ error: `Provider '${provider}' not supported.` }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+
+            // Execute the corresponding routing track safely
+            const result = await FETCH_PROVIDERS[provider](env, targetUrl);
+
+            return new Response(JSON.stringify(result), {
+                status: 200,
+                headers: { "Content-Type": "application/json" }
+            });
+
+        } catch (error) {
+            return new Response(JSON.stringify({ error: error.message }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+    }
 };
