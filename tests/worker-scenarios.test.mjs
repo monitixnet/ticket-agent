@@ -29,7 +29,8 @@ import {
   isPriceParityMatch,
 } from '../venue-rules.js';
 import {
-  segerstromDrillDownStrategy
+  segerstromDrillDownStrategy,
+  segerstromProductionDiscoveryStrategy
 } from '../strategies.js';
 import {
   getNextUpcomingEvent,
@@ -37,6 +38,7 @@ import {
   getListingForValidation,
   upsertDiscoveredEvents,
 } from '../database/queries.js';
+import { normalizeExternalId } from '../utils.js';
 
 const WEBHOOK_SECRET = 'test-shared-secret';
 
@@ -65,6 +67,12 @@ const run = async () => {
     const result = evaluateEquivalentInventoryCoverage({ quantity: 2 }, [{ quantity: 6 }]);
     assert.equal(result.targetQuantity, 2);
     assert.equal(result.equivalentInventoryCount, 6);
+  });
+
+  test('external numeric IDs discard only a decimal-zero suffix', () => {
+    assert.equal(normalizeExternalId('31946.0'), '31946');
+    assert.equal(normalizeExternalId('00123'), '00123');
+    assert.equal(normalizeExternalId('section-A'), 'section-A');
   });
 
   test('venue timezone inference resolves Segerstrom to Los Angeles', () => {
@@ -338,8 +346,10 @@ const run = async () => {
       },
     };
 
-    const fakeExecuteSecureFetch = async (env, url) => {
-      return { text: JSON.stringify(mockApiResponses[url] || {}) };
+    const apiRequests = [];
+    const fakeExecuteSecureFetch = async (_env, url, _targetRow, options) => {
+      apiRequests.push({ url, options });
+      return { text: JSON.stringify(mockApiResponses[url] || {}), status: 200 };
     };
 
     const result = await segerstromDrillDownStrategy(targetRow, '', {}, {}, fakeExecuteSecureFetch, () => {}, mockAdapter);
@@ -352,6 +362,8 @@ const run = async () => {
     assert.equal(seat.priceLevel, 9050);
     assert.equal(seat.priceCents, 20678);
     assert.equal(seat.available, true);
+    assert.equal(apiRequests.length, 4);
+    assert.equal(apiRequests.every(({ options }) => options.apiRequest === true), true);
   });
 
   test('discovery persistence uses the schema column names and deterministic show IDs', async () => {
@@ -374,6 +386,42 @@ const run = async () => {
     assert.equal(statements[1].values[1], 'segerstrom_center:Example%20Show');
   });
 
+  test('production discovery routes the SeatMe settings API through the API provider', async () => {
+    let state = null;
+    const fakeDb = {
+      prepare(sql) {
+        return {
+          bind: (...values) => ({
+            first: async () => sql.includes('SELECT value_string') && state ? { value_string: JSON.stringify(state) } : null,
+            run: async () => {
+              if (sql.includes('INSERT OR REPLACE INTO system_state')) state = JSON.parse(values[1]);
+              return { changes: 1 };
+            },
+            sql,
+            values
+          })
+        };
+      },
+      batch: async statements => statements.map(() => ({ changes: 1 }))
+    };
+    const settingsRequests = [];
+    const adapter = {
+      venueName: 'Segerstrom Center for the Arts', algoliaAppId: 'app', algoliaApiKey: 'key', algoliaIndexName: 'index',
+      buyButtonApiUrl: 'https://www.scfta.org/BuyButton/ButtonById',
+      settingsApiUrlPattern: 'https://seatme.scfta.org/api/settings/performance/{performanceId}',
+      ticketingUrlTemplate: 'https://seatme.scfta.org/single?id={performanceId}'
+    };
+    const secureFetch = async (_env, url, _target, options) => {
+      if (url.includes('ButtonById')) return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ SubItems: [{ ItemId: 123, Status: 'OnSale', TicketCount: 1 }] }) };
+      settingsRequests.push({ url, options });
+      return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show' }] }) };
+    };
+    const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show' }], nbPages: 1 }) });
+    await segerstromProductionDiscoveryStrategy({ venue_id: 'segerstrom_center' }, '', { DB: fakeDb }, {}, secureFetch, () => {}, adapter, apiFetch);
+    assert.equal(settingsRequests.length, 1);
+    assert.equal(settingsRequests[0].options.apiRequest, true);
+  });
+
   test('targets endpoint requires authentication and does not disclose adapter secrets', async () => {
     const denied = await worker.fetch(new Request('https://example.com/targets'), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
     assert.equal(denied.status, 401);
@@ -388,6 +436,7 @@ const run = async () => {
     assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true' }), false);
     assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true', ENABLE_AUTOMATED_APPROVAL: 'true' }), true);
   });
+
 
 };
 

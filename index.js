@@ -217,13 +217,13 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
 
   if (targetRow?.security_tier === 'high') {
     // For high-security targets, intelligently select the provider type.
-    if (method === 'POST') {
+    if (method === 'POST' || fetchOptions.apiRequest === true) {
       // API calls use a dedicated, configurable provider pool.
       // Defaults to the API proxy with a native fetch fallback.
       providerPool = (env.API_FETCH_PROVIDER_POOL || 'zenrows_api,native').split(',').map(p => p.trim()).filter(Boolean);
     } else {
       // Web page scrapes use the browser rendering provider.
-      providerPool = (env.FETCH_PROVIDER_POOL || 'zenrows_browser').split(',').map(p => p.trim()).filter(Boolean);
+      providerPool = (env.FETCH_PROVIDER_POOL || 'zenrows_browser,native').split(',').map(p => p.trim()).filter(Boolean);
     }
   }
 
@@ -240,9 +240,11 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
       const result = await provider(env, targetUrlString, targetRow, fetchOptions);
       lastResult = result;
 
-      // If the provider was rate-limited, log it and try the next one in the pool.
-      if (result.status === 429) {
-        console.log(`[PROVIDER POOL] Provider ${providerName} was rate-limited. Attempting next provider.`);
+      // A proxy error must not prevent the configured fallback provider from
+      // attempting the request. Target responses such as NotOnSale are still
+      // normal 2xx responses and return immediately.
+      if (result.status < 200 || result.status >= 300) {
+        console.log(`[PROVIDER POOL] Provider ${providerName} returned HTTP ${result.status}. Attempting next provider.`);
         continue;
       }
 
@@ -784,6 +786,13 @@ Outcome: Transaction blocked automatically before a ghost sale collision could o
       event?.cron === 'test-listing-watch' ? 'listing_watch' :
       event?.cron === 'test-discovery-scan' ? 'discovery_scan' :
       undefined;
-    await runScheduledCycle(env, ctx, forcedMode ? { forcedMode } : {});
+    const cycle = runScheduledCycle(env, ctx, forcedMode ? { forcedMode } : {});
+    // Scheduled events must acknowledge promptly. The work continues under
+    // waitUntil rather than holding the local cron HTTP trigger open.
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(cycle);
+      return;
+    }
+    await cycle;
   },
 };

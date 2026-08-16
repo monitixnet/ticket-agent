@@ -4,10 +4,15 @@ function redactSensitiveLogValue(value) {
     .replace(/("(?:api[_-]?key|apikey|token|secret|authorization)"\s*:\s*")[^"]*/gi, '$1[REDACTED]');
 }
 
-async function nativeFetchProvider(_env, targetUrlString) {
+async function nativeFetchProvider(_env, targetUrlString, _targetRow, fetchOptions = {}) {
   console.log(`[FREE NETWORK] Running free native fetch -> ${redactSensitiveLogValue(targetUrlString)}`);
   const res = await fetch(targetUrlString, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    method: fetchOptions.method || 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      ...(fetchOptions.headers || {})
+    },
+    body: fetchOptions.body
   });
   return { text: await res.text(), status: res.status, routedVia: 'nativeFetchProvider' };
 }
@@ -66,7 +71,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
         let pageSessionId = null;
         let pageTargetId = null;
         let isSettled = false;
-        const waitFor = _env.ZENROWS_WAIT_FOR || '.card-wrap'; // Default wait time of 7 seconds
+        const waitTime = Number(_env.ZENROWS_WAIT_TIME || 7373);
 
         const timeout = setTimeout(() => webSocket.close(1001, 'Timeout'), BROWSER_TIMEOUT);
 
@@ -99,7 +104,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
                 // FIXED & ENHANCED: Injecting a 7-second browser pause inside the DOM 
                 // execution frame before grabbing the hydrated page outerHTML code.
                 cdpSend('Runtime.evaluate', { 
-                    expression: 'new Promise(resolve => setTimeout(() => resolve(document.documentElement.outerHTML), waitFor))',
+                    expression: `new Promise(resolve => setTimeout(() => resolve(document.documentElement.outerHTML), ${waitTime}))`,
                     awaitPromise: true 
                 }, pageSessionId)
                     .then(result => {

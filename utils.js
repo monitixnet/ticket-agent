@@ -23,6 +23,13 @@ export const buildWorkerLogId = () => (typeof crypto !== 'undefined' && typeof c
   ? crypto.randomUUID()
   : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
+// Tessitura/Algolia numeric IDs can arrive as a JavaScript number and become
+// strings such as "31946.0". Keep all other identifiers byte-for-byte stable.
+export function normalizeExternalId(value) {
+  const raw = String(value ?? '').trim();
+  return /^\d+\.0+$/.test(raw) ? raw.replace(/\.0+$/, '') : raw;
+}
+
 export function parseVenueTime(localDatePart, localTimePart, timeZone, year) {
   // localDatePart example: "Wednesday, Aug. 12" or "Aug. 12"
   // localTimePart example: "7:30 PM"

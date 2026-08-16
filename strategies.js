@@ -1,7 +1,7 @@
 import { VENUE_PARSERS } from './venue-rules.js';
 import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState } from './database/queries.js';
 import { ACTIVE_VENUE_ADAPTERS } from './venue-config.js';
-import { delayExecution, randomBetween } from './utils.js';
+import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 
 export async function singleStepParseStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, _trackWorkerLog) {
   const parser = VENUE_PARSERS[targetRow.venue_id];
@@ -29,7 +29,7 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     // Step 1: Get performance settings, which includes the mapping of sectionGroupId to section names.
     const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', performanceId);
     console.log(`[PARSER] Fetching performance settings from: ${settingsUrl}`); // Keep logging for visibility
-    const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET' });
+    const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
     const settingsData = JSON.parse(settingsPayload.text || '{}');
     const sectionNameMap = (settingsData?.facilitySettings?.sectionGroupings || []).reduce((map, group) => {
       map[group.sectionGroupId] = group.description;
@@ -39,7 +39,7 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     // Step 2: Get pricing information for all zones.
     const priceApiUrl = adapter.priceApiUrlPattern?.replace('{performanceId}', performanceId);
     console.log(`[PARSER] Fetching zone pricing from: ${priceApiUrl}`); // Keep logging for visibility
-    const pricePayload = await executeSecureFetch(env, priceApiUrl, targetRow, { method: 'GET' });
+    const pricePayload = await executeSecureFetch(env, priceApiUrl, targetRow, { method: 'GET', apiRequest: true });
     const priceData = JSON.parse(pricePayload.text || '[]');
     const zonePriceMap = priceData.reduce((map, zone) => {
       if (zone.prices?.[0]) {
@@ -51,7 +51,7 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     // Step 3: Get section availability.
     const sectionAvailabilityUrl = adapter.inventoryApiUrlPattern?.replace('{performanceId}', performanceId);
     console.log(`[PARSER] Fetching section availability from: ${sectionAvailabilityUrl}`); // Keep logging for visibility
-    const sectionPayload = await executeSecureFetch(env, sectionAvailabilityUrl, targetRow, { method: 'GET' });
+    const sectionPayload = await executeSecureFetch(env, sectionAvailabilityUrl, targetRow, { method: 'GET', apiRequest: true });
     const sectionGroups = JSON.parse(sectionPayload.text || '[]');
 
     const allSeatData = [];
@@ -62,7 +62,7 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
         if (group.sectionGroupId) {
           const seatInfoUrl = adapter.seatInfoApiUrlPattern?.replace('{performanceId}', performanceId)?.replace('{groupId}', group.sectionGroupId);
           console.log(`[PARSER] Fetching detailed seat info from: ${seatInfoUrl}`); // Keep logging for visibility
-          return executeSecureFetch(env, seatInfoUrl, targetRow, { method: 'GET' }).then(payload => ({ ...JSON.parse(payload.text || '{}'), sectionGroupName: sectionNameMap[group.sectionGroupId] || group.sectionGroupName }));
+          return executeSecureFetch(env, seatInfoUrl, targetRow, { method: 'GET', apiRequest: true }).then(payload => ({ ...JSON.parse(payload.text || '{}'), sectionGroupName: sectionNameMap[group.sectionGroupId] || group.sectionGroupName }));
         }
         return Promise.resolve(null); // Return a resolved promise for groups without ID
       });
@@ -120,7 +120,7 @@ export async function calendarPageDiscoveryStrategy(targetRow, htmlBody, env, ct
         
         const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', performanceId);
         console.log(`[PARSER] Found performanceId ${performanceId}. Fetching all showtimes from: ${settingsUrl}`);
-        const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET' });
+        const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
         const settingsData = JSON.parse(settingsPayload.text || '{}');
         
         if (settingsData.additionalPerformances) {
@@ -159,20 +159,33 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
     console.log(`[PARSER] No active discovery job found. Starting a new one.`);
     const { algoliaAppId, algoliaApiKey, algoliaIndexName } = adapter;
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
-    const algoliaPayload = { params: 'hitsPerPage=100&filters=ExcludeFromCalendar:false AND ItemType:Production' };
-    const algoliaResponse = await executeApiFetch(algoliaUrl, {
-      method: 'POST',
-      body: JSON.stringify(algoliaPayload),
-      headers: { 'Content-Type': 'application/json', 'X-Algolia-Application-Id': algoliaAppId, 'X-Algolia-API-Key': algoliaApiKey }
-    });
+    const headers = { 'Content-Type': 'application/json', 'X-Algolia-Application-Id': algoliaAppId, 'X-Algolia-API-Key': algoliaApiKey };
+    const maxPages = Math.max(1, Math.min(Number(env.DISCOVERY_MAX_PAGES) || 100, 100));
+    const productionQueue = [];
+    let page = 0;
+    let totalPages = 1;
 
-    const searchResults = JSON.parse(algoliaResponse.text || '{}');
-    if (!searchResults.hits) {
-      trackWorkerLog(env, ctx, 'error', `[PARSER - ${adapter.venueName}] Algolia query failed or returned no hits.`, { response: searchResults });
-      return [];
+    while (page < totalPages && page < maxPages) {
+      const algoliaPayload = { params: `hitsPerPage=100&page=${page}&filters=ExcludeFromCalendar:false AND ItemType:Production` };
+      const algoliaResponse = await executeApiFetch(algoliaUrl, {
+        method: 'POST',
+        body: JSON.stringify(algoliaPayload),
+        headers
+      });
+      const searchResults = JSON.parse(algoliaResponse.text || '{}');
+      if (!Array.isArray(searchResults.hits)) {
+        trackWorkerLog(env, ctx, 'error', `[PARSER - ${adapter.venueName}] Algolia query failed or returned no hits.`, { page, responseStatus: algoliaResponse.status });
+        return [];
+      }
+
+      productionQueue.push(...searchResults.hits.map(hit => ({ id: normalizeExternalId(hit.TessituraId), title: hit.Title })).filter(p => p.id));
+      totalPages = Math.max(1, Number(searchResults.nbPages) || 1);
+      page += 1;
     }
 
-    const productionQueue = searchResults.hits.map(hit => ({ id: hit.TessituraId, title: hit.Title })).filter(p => p.id);
+    if (page < totalPages) {
+      trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Discovery stopped at configured page limit.`, { maxPages, totalPages });
+    }
     jobState = { productionQueue, processedIds: [], totalEventsDiscovered: 0 };
     initialQueueSize = productionQueue.length;
     console.log(`[PARSER] Created new discovery job with ${productionQueue.length} productions.`);
@@ -241,29 +254,39 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
       const onSalePerformanceIds = new Set(
         (button?.SubItems || [])
           .filter(item => item.Status === 'OnSale' && Number(item.TicketCount) > 0)
-          .map(item => String(item.ItemId))
+          .map(item => normalizeExternalId(item.ItemId))
       );
-      const firstOnSaleSubItem = button?.SubItems?.find(si => onSalePerformanceIds.has(String(si.ItemId)));
+      const firstOnSaleSubItem = button?.SubItems?.find(si => onSalePerformanceIds.has(normalizeExternalId(si.ItemId)));
       
       if (firstOnSaleSubItem) {
-        const representativePerformanceId = firstOnSaleSubItem.ItemId.toString();
+        const representativePerformanceId = normalizeExternalId(firstOnSaleSubItem.ItemId);
         const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', representativePerformanceId);
         if (!settingsUrl) throw new Error('settingsApiUrlPattern is not configured in the adapter.');
 
         console.log(`[PARSER] Fetching settings for production "${productionTitle}" via performanceId: ${representativePerformanceId}`);
-        const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET' });
+        const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
         if (settingsPayload.status < 200 || settingsPayload.status >= 300) {
           throw new Error(`Settings API returned HTTP ${settingsPayload.status}.`);
         }
         const settingsData = JSON.parse(settingsPayload.text || '{}');
+        const additionalPerformances = Array.isArray(settingsData.additionalPerformances)
+          ? settingsData.additionalPerformances
+          : [];
+        console.log(`[PARSER] Settings response summary`, {
+          productionId: productionSeasonId,
+          responseStatus: settingsPayload.status,
+          routedVia: settingsPayload.routedVia,
+          additionalPerformanceCount: additionalPerformances.length,
+          onSalePerformanceCount: onSalePerformanceIds.size
+        });
 
-        if (settingsData.additionalPerformances) {
-          for (const p of settingsData.additionalPerformances) {
-            if (p.performanceId && p.performanceDate && onSalePerformanceIds.has(String(p.performanceId))) {
+        if (additionalPerformances.length) {
+          for (const p of additionalPerformances) {
+            if (p.performanceId && p.performanceDate && onSalePerformanceIds.has(normalizeExternalId(p.performanceId))) {
               allDiscoveredEvents.push({
                 showName: p.description || `Performance ${p.performanceId}`,
                 showtime: p.performanceDate.replace('T', ' '),
-                eventId: p.performanceId,
+                eventId: normalizeExternalId(p.performanceId),
                 venueId: targetRow.venue_id,
                 eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
               });
@@ -283,6 +306,7 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
         console.log(`[PARSER] Skipping production ${productionSeasonId} ("${productionTitle}") because its overall status is "${button.Status}" (HTTP: ${buttonResponse.status}) and no on-sale performances were found (${subItemSummary}).`);
       }
     } catch (err) {
+      console.error(`[PARSER - ${adapter.venueName}] Production ${productionSeasonId} failed: ${err.message}`);
       trackWorkerLog(env, ctx, 'error', `[PARSER - ${adapter.venueName}] Unhandled error processing production hit.`, { productionId: productionSeasonId, title: productionTitle, error: err.message });
     }
     jobState.processedIds.push(productionSeasonId);
@@ -371,7 +395,7 @@ export async function algoliaDiscoveryStrategy(targetRow, _htmlBody, env, ctx, e
             
             // This is a direct API call, so we use executeApiFetch.
             try {
-              const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET' });
+              const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
               const settingsData = JSON.parse(settingsPayload.text || '{}');
 
               if (settingsData.additionalPerformances) {

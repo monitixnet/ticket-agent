@@ -210,7 +210,7 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
 
     const eventInsert = db.prepare("INSERT OR IGNORE INTO events (id, show_id, showtime, event_url) VALUES (?, ?, ?, ?)"); // event_url is the ticketing page URL
     for (const event of events) {
-      statements.push({ kind: 'event', statement: eventInsert.bind(event.eventId, showId, event.showtime, event.eventDetailUrl) });
+      statements.push({ kind: 'event', statement: eventInsert.bind(normalizeExternalId(event.eventId), showId, event.showtime, event.eventDetailUrl) });
     }
   }
 
@@ -219,3 +219,4 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
   console.log(`[DB] Upsert complete. Inserted ${inserted} new event(s) out of ${discoveredEvents.length} discovered.`);
   return { inserted, total: discoveredEvents.length };
 }
+import { normalizeExternalId } from '../utils.js';
