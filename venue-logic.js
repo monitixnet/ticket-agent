@@ -10,9 +10,11 @@ import {
 } from './global-config.js';
 
 export function isSkyboxListingEnabled(env) {
-  const rawValue = env?.ALLOW_SKYBOX_LISTING ?? env?.SKYBOX_LISTING_ENABLED ?? 'false';
-  const normalized = String(rawValue).trim().toLowerCase();
-  return ['1', 'true', 'yes', 'on'].includes(normalized);
+  const isEnabled = value => ['1', 'true', 'yes', 'on'].includes(String(value ?? 'false').trim().toLowerCase());
+  // Listing approval is intentionally a two-person/configuration action. A
+  // monitoring deployment cannot become an approval service from one typo.
+  return isEnabled(env?.ALLOW_SKYBOX_LISTING ?? env?.SKYBOX_LISTING_ENABLED)
+    && isEnabled(env?.ENABLE_AUTOMATED_APPROVAL);
 }
 
 function findInMap(map, venueIdentifier) {

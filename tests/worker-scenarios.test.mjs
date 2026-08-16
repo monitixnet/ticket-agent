@@ -16,6 +16,7 @@ import {
   resolveVenueAdapter,
   isBlockLikeStatus,
   computeBackoffDelayMs,
+  isSkyboxListingEnabled,
 } from '../venue-logic.js';
 import {
   ACTIVE_VENUE_SET,
@@ -28,13 +29,13 @@ import {
   isPriceParityMatch,
 } from '../venue-rules.js';
 import {
-  segerstromDrillDownStrategy,
-  multiStepApiDiscoveryStrategy
+  segerstromDrillDownStrategy
 } from '../strategies.js';
 import {
   getNextUpcomingEvent,
   getNextEventWithActiveListing,
   getListingForValidation,
+  upsertDiscoveredEvents,
 } from '../database/queries.js';
 
 const WEBHOOK_SECRET = 'test-shared-secret';
@@ -80,9 +81,9 @@ const run = async () => {
     assert.equal(getScheduleModeForCronDate(date), 'listing_watch');
   });
 
-  test('idle mode is selected outside the monitoring cadence', () => {
+  test('discovery scan is selected at minute 22', () => {
     const date = new Date(Date.UTC(2026, 7, 3, 0, 22, 0));
-    assert.equal(getScheduleModeForCronDate(date), 'idle');
+    assert.equal(getScheduleModeForCronDate(date), 'discovery_scan');
   });
 
   test('monitoring-only mode blocks outbound Skybox approval requests', async () => {
@@ -127,16 +128,9 @@ const run = async () => {
     assert.equal(response.status, 401);
   });
 
-  test('active venue set includes only the approved venues and excludes disallowed sources', () => {
+  test('active venue set includes only the configured production venue', () => {
     assert.deepEqual(ACTIVE_VENUE_SET, [
-      'segerstrom_center',
-      'citizen_opera_house',
-      'asu_gammage',
-      'first_interstate_center_for_the_arts',
-      'orpheum_minneapolis',
-      'orpheum_san_francisco',
-      'paramount_theatre_seattle',
-      'aronoff_center'
+      'segerstrom_center'
     ]);
     assert.equal(ACTIVE_VENUE_SET.includes('grand_ole_opry'), false);
     assert.equal(ACTIVE_VENUE_SET.includes('broadway_com'), false);
@@ -152,9 +146,9 @@ const run = async () => {
     assert.equal(policy.reason, null);
   });
 
-  test('the eight-venue smoke matrix is ready without enabling outbound listing approval', () => {
-    assert.equal(ACTIVE_VENUE_SMOKE_MATRIX.length, 8);
-    assert.equal(ACTIVE_VENUE_SET.length, 8);
+  test('the active-venue smoke matrix is monitoring-only', () => {
+    assert.equal(ACTIVE_VENUE_SMOKE_MATRIX.length, 1);
+    assert.equal(ACTIVE_VENUE_SET.length, 1);
     assert.equal(isSmokeMatrixReady(), true);
     assert.equal(buildVenueAdapterSmokeReport().every(entry => entry.monitoringOnly === true), true);
     assert.equal(buildVenueAdapterSmokeReport().every(entry => entry.outboundApprovalEnabled === false), true);
@@ -163,8 +157,8 @@ const run = async () => {
   test('operational telemetry exposes a summary snapshot for each active venue', () => {
     const snapshot = buildOperationalTelemetrySnapshot(new Date('2026-08-03T15:00:00-07:00'), { ALLOW_SKYBOX_LISTING: 'false' });
     assert.equal(snapshot.monitoringOnly, true);
-    assert.equal(snapshot.activeVenueCount, 8);
-    assert.equal(snapshot.venues.length, 8);
+    assert.equal(snapshot.activeVenueCount, 1);
+    assert.equal(snapshot.venues.length, 1);
     assert.equal(snapshot.venues.every(entry => entry.reasonCode), true);
     assert.equal(snapshot.venues.some(entry => entry.venueId === 'segerstrom_center'), true);
     assert.equal(snapshot.venues.some(entry => entry.businessWindowOpen === true), true);
@@ -360,23 +354,39 @@ const run = async () => {
     assert.equal(seat.available, true);
   });
 
-  test('Segerstrom discovery strategy returns empty inventory and calls upsert', async () => {
-    const targetRow = { venue_id: 'segerstrom_center', event_url: 'https://www.scfta.org/shows-events' };
-    const calendarHtml = `<div class="cell image-container "><a href="/events/2026/some-show"></a><a class="event-link buy-tickets" href="https://seatme.scfta.org/single?id=12345">Buy now</a></div>`;
-    const detailPageHtml = `<li class="cell small-4 large-5 buy-performance" data-productionid="12345"></li>`;
-    const settingsApiJson = { additionalPerformances: [{ performanceId: 12345, description: 'Some Show', performanceDate: '2026-09-19T19:30:00' }] };
-
-    const fakeExecuteSecureFetch = async (env, url) => {
-      if (url.includes('/shows-events')) return { text: calendarHtml };
-      if (url.includes('/events/2026/some-show')) return { text: detailPageHtml };
-      if (url.includes('/api/settings/performance/')) return { text: JSON.stringify(settingsApiJson) };
-      return { text: '{}' };
+  test('discovery persistence uses the schema column names and deterministic show IDs', async () => {
+    const statements = [];
+    const fakeDb = {
+      prepare(sql) {
+        return { bind: (...values) => ({ sql, values }) };
+      },
+      batch: async batch => {
+        statements.push(...batch);
+        return batch.map(() => ({ changes: 1 }));
+      }
     };
+    const result = await upsertDiscoveredEvents(fakeDb, [{
+      showName: 'Example Show', venueId: 'segerstrom_center', eventId: 'event-1',
+      showtime: '2026-12-01T20:00:00Z', eventDetailUrl: 'https://example.test/event-1'
+    }]);
+    assert.equal(result.inserted, 1);
+    assert.match(statements[0].sql, /shows \(id, venue_id, show_name\)/);
+    assert.equal(statements[1].values[1], 'segerstrom_center:Example%20Show');
+  });
 
-    const fakeTrackWorkerLog = () => {};
-    const fakeCtx = { waitUntil: () => {} };
-    const result = await multiStepApiDiscoveryStrategy(targetRow, calendarHtml, { DB: { prepare: () => ({ bind: () => ({ first: () => ({ id: 1 }) }) }), batch: () => ([]) } }, fakeCtx, fakeExecuteSecureFetch, fakeTrackWorkerLog);
-    assert.deepEqual(result, []);
+  test('targets endpoint requires authentication and does not disclose adapter secrets', async () => {
+    const denied = await worker.fetch(new Request('https://example.com/targets'), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(denied.status, 401);
+
+    const allowed = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    const payload = await allowed.json();
+    assert.equal(allowed.status, 200);
+    assert.equal('algoliaApiKey' in payload.venue_adapters[0], false);
+  });
+
+  test('automated approval requires two explicit production controls', () => {
+    assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true' }), false);
+    assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true', ENABLE_AUTOMATED_APPROVAL: 'true' }), true);
   });
 
 };

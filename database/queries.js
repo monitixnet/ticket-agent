@@ -187,7 +187,7 @@ export async function cleanupOldWorkerLogs(db) {
 export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
   if (!discoveredEvents.length) return { inserted: 0, updated: 0 };
 
-  const stmts = [];
+  const statements = [];
   // Group events by show name to reduce show lookups
   const shows = discoveredEvents.reduce((acc, event) => {
     if (!acc[event.showName]) {
@@ -199,19 +199,23 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
 
   for (const showName in shows) {
     const { venueId, events } = shows[showName];
-    // Upsert show to get a stable show_id
-    stmts.push(db.prepare("INSERT INTO shows (name, venue_id) VALUES (?, ?) ON CONFLICT(name, venue_id) DO NOTHING").bind(showName, venueId));
-    const show = await db.prepare("SELECT id FROM shows WHERE name = ? AND venue_id = ?").bind(showName, venueId).first();
-    const showId = show.id;
+    // A deterministic ID lets the show and its events be inserted atomically in
+    // one D1 batch without a read-after-write race.
+    const showId = `${venueId}:${encodeURIComponent(showName)}`;
+    statements.push({
+      kind: 'show',
+      statement: db.prepare('INSERT OR IGNORE INTO shows (id, venue_id, show_name) VALUES (?, ?, ?)')
+        .bind(showId, venueId, showName)
+    });
 
-    // Batch insert all events for this show
     const eventInsert = db.prepare("INSERT OR IGNORE INTO events (id, show_id, showtime, event_url) VALUES (?, ?, ?, ?)"); // event_url is the ticketing page URL
-    const eventStmts = events.map(event => eventInsert.bind(event.eventId, showId, event.showtime, event.eventDetailUrl));
-    stmts.push(...eventStmts);
+    for (const event of events) {
+      statements.push({ kind: 'event', statement: eventInsert.bind(event.eventId, showId, event.showtime, event.eventDetailUrl) });
+    }
   }
 
-  const results = await db.batch(stmts);
-  const inserted = results.reduce((sum, res) => sum + (res.changes ?? 0), 0);
+  const results = await db.batch(statements.map(({ statement }) => statement));
+  const inserted = results.reduce((sum, res, index) => sum + (statements[index].kind === 'event' ? (res.changes ?? 0) : 0), 0);
   console.log(`[DB] Upsert complete. Inserted ${inserted} new event(s) out of ${discoveredEvents.length} discovered.`);
   return { inserted, total: discoveredEvents.length };
 }

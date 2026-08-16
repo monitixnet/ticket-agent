@@ -32,20 +32,29 @@ ZENROWS_API_URL="https://api.zenrows.com/v1/"
 ZENROWS_API_TOKEN="your_zenrows_api_token_here"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 WEBHOOK_SHARED_SECRET="your_shared_secret_here"
+ALLOW_SKYBOX_LISTING="false"
+ENABLE_AUTOMATED_APPROVAL="false"
 ```
 
 `WEBHOOK_SHARED_SECRET` authenticates callers of the endpoints below. Requests must include it as an `X-Webhook-Secret` header; requests without a matching header are rejected with `401`. Generate a real value yourself — it's just a random secret, not tied to any external system — for example: `openssl rand -hex 32`. Whoever calls `/webhook/validate` or `/logs/recent` needs to be given that same value to send back as the header. Today that's limited to your own tooling and local testing, since there is no live Skybox integration yet (see [Hard boundaries](#hard-boundaries)).
 
-Then initialize the database with the included seed file:
+Then initialize local D1 using the versioned migrations and seed file:
 
 ```bash
-sqlite3 ticket-agent.db < database/schema.sql
-sqlite3 ticket-agent.db < database/seed.sql
+npx wrangler d1 migrations apply ticket-agent-db --local
+npx wrangler d1 execute ticket-agent-db --local --file=database/seed.sql
 ```
 
 The Cloudflare D1 binding name used by the worker is `DB`, matching the code in [index.js](index.js).
 
-For the deployed Cloudflare D1 database, use the equivalent SQL statements in the Wrangler console or run the same inserts through your database client.
+For deployed Cloudflare D1, apply migrations before deployment and seed once:
+
+```bash
+npx wrangler d1 migrations apply ticket-agent-db --remote
+npx wrangler d1 execute ticket-agent-db --remote --file=database/seed.sql
+```
+
+`ALLOW_SKYBOX_LISTING` and `ENABLE_AUTOMATED_APPROVAL` must both be explicitly enabled before the validation webhook can return an approval. Keep both `false` until a signed, replay-protected upstream integration has been implemented and reviewed.
 
 Each listing stores its listed price as `price_cents` (integer cents) on the `listings` table. At validation time, the live-scraped price for that exact seat must match `price_cents` exactly, or the listing is rejected for a price-parity failure.
 

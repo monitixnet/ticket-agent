@@ -60,6 +60,17 @@ export function buildHumanReviewNotification(payload = {}) {
   };
 }
 
+function buildPublicAdapterSummaries() {
+  return Object.values(ACTIVE_VENUE_ADAPTERS).map(({ venueId, venueName, timezoneName, securityTier, active, monitoringOnly }) => ({
+    venueId,
+    venueName,
+    timezoneName,
+    securityTier,
+    active,
+    monitoringOnly
+  }));
+}
+
 function trackWorkerLog(env, ctx, level, message, context = {}) {
   const logLine = `[${level.toUpperCase()}] ${message}`;
   if (level === 'error') {
@@ -501,13 +512,16 @@ export default {
     if (url.pathname === '/favicon.ico') return new Response(null, { status: 204 });
 
     if (url.pathname === '/monitoring/targets' || url.pathname === '/targets') {
+      if (!isRequestAuthorized(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      }
       return new Response(JSON.stringify({
         generated_at: new Date().toISOString(),
         listing_enabled: isSkyboxListingEnabled(env),
         monitoring_only: !isSkyboxListingEnabled(env),
         targets: MONITORED_TARGETS,
         venue_smoke_matrix: buildVenueAdapterSmokeReport(),
-        venue_adapters: Object.values(ACTIVE_VENUE_ADAPTERS),
+        venue_adapters: buildPublicAdapterSummaries(),
         telemetry: buildOperationalTelemetrySnapshot(new Date(), env)
       }, null, 2), {
         status: 200,
@@ -537,7 +551,7 @@ export default {
         monitoring_only: !isSkyboxListingEnabled(env),
         monitored_targets: MONITORED_TARGETS.map(({ id, name, state_code, security_tier }) => ({ id, name, state_code, security_tier })),
         venue_smoke_matrix: buildVenueAdapterSmokeReport(),
-        venue_adapters: Object.values(ACTIVE_VENUE_ADAPTERS),
+        venue_adapters: buildPublicAdapterSummaries(),
         telemetry: buildOperationalTelemetrySnapshot(new Date(), env)
       }, null, 2), {
         status: 200,

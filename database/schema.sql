@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS shows (
     id TEXT PRIMARY KEY,
     venue_id TEXT NOT NULL,
     show_name TEXT NOT NULL,
+    UNIQUE (venue_id, show_name),
     FOREIGN KEY(venue_id) REFERENCES venues(id) ON DELETE CASCADE
 );
 
@@ -39,6 +40,10 @@ CREATE TABLE IF NOT EXISTS listings (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_skybox_listing_id ON listings(skybox_listing_id);
+CREATE INDEX IF NOT EXISTS idx_events_showtime ON events(showtime);
+CREATE INDEX IF NOT EXISTS idx_events_last_scanned_at ON events(last_scanned_at);
 
 -- 5. State Machine Pointers
 CREATE TABLE IF NOT EXISTS system_state (

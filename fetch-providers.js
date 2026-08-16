@@ -1,5 +1,11 @@
+function redactSensitiveLogValue(value) {
+  return String(value)
+    .replace(/([?&](?:api[_-]?key|apikey|token|secret|authorization)=)[^&#\s]*/gi, '$1[REDACTED]')
+    .replace(/("(?:api[_-]?key|apikey|token|secret|authorization)"\s*:\s*")[^"]*/gi, '$1[REDACTED]');
+}
+
 async function nativeFetchProvider(_env, targetUrlString) {
-  console.log(`[FREE NETWORK] Running free native fetch -> ${targetUrlString}`);
+  console.log(`[FREE NETWORK] Running free native fetch -> ${redactSensitiveLogValue(targetUrlString)}`);
   const res = await fetch(targetUrlString, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
   });
@@ -7,7 +13,7 @@ async function nativeFetchProvider(_env, targetUrlString) {
 }
 
 async function executeCdpSession(providerName, provisioningDetails, targetUrlString) {
-    console.log(`[${providerName.toUpperCase()} BROWSER] Routing via remote browser -> ${targetUrlString}`);
+    console.log(`[${providerName.toUpperCase()} BROWSER] Routing via remote browser -> ${redactSensitiveLogValue(targetUrlString)}`);
 
     const { provisioningUrl, authHeaders } = provisioningDetails;
 
@@ -157,7 +163,7 @@ async function executeCdpSession(providerName, provisioningDetails, targetUrlStr
 }
 
 async function zenrowsApiProxyProvider(env, targetUrlString, _targetRow, fetchOptions = {}) {
-    console.log(`[ZENROWS API PROXY] Routing via ZenRows proxy -> ${targetUrlString}`);
+    console.log(`[ZENROWS API PROXY] Routing via ZenRows proxy -> ${redactSensitiveLogValue(targetUrlString)}`);
     const apiUrl = env.ZENROWS_API_URL || 'https://api.zenrows.com/v1/';
     const apiToken = env.ZENROWS_API_TOKEN;
     if (!apiToken) {
@@ -193,9 +199,9 @@ async function zenrowsApiProxyProvider(env, targetUrlString, _targetRow, fetchOp
     const res = await fetch(finalZenrowsUrl, finalZenrowsOptions);
     const responseText = await res.text();
     if (fetchOptions.debug) {
-      console.log(`[ZENROWS DEBUG] Raw response text: ${responseText}`);
+      console.log(`[ZENROWS DEBUG] Raw response text: ${redactSensitiveLogValue(responseText)}`);
     } else {
-      console.log(`[ZENROWS DEBUG] Raw response text (first 500 chars): ${responseText.slice(0, 500)}`);
+      console.log(`[ZENROWS DEBUG] Raw response text (first 500 chars): ${redactSensitiveLogValue(responseText.slice(0, 500))}`);
     }
 
     try {
@@ -224,7 +230,7 @@ async function zenrowsApiProxyProvider(env, targetUrlString, _targetRow, fetchOp
 }
 
 async function zenrowsBrowserProvider(env, targetUrlString) {
-    console.log(`[ZENROWS BROWSER] Routing via ZenRows proxy -> ${targetUrlString}`);
+    console.log(`[ZENROWS BROWSER] Routing via ZenRows proxy -> ${redactSensitiveLogValue(targetUrlString)}`);
     const apiUrl = env.ZENROWS_API_URL || 'https://api.zenrows.com/v1/';
     const apiToken = env.ZENROWS_API_TOKEN;
     if (!apiToken) throw new Error('Missing ZENROWS_API_TOKEN for zenrowsBrowserProvider.');

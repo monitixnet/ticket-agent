@@ -149,7 +149,6 @@ export async function calendarPageDiscoveryStrategy(targetRow, htmlBody, env, ct
  */
 export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
   console.log(`[PARSER] Segerstrom API-driven discovery strategy initiated for venue ${targetRow.venue_id}.`);
-  console.log(`[PARSER] Adapter object received: ${JSON.stringify(adapter)}`); // NEW DEBUG LOG
 
   const JOB_KEY = `segerstrom_discovery_job`;
   let initialQueueSize = 0;
@@ -196,7 +195,6 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
 
   const allDiscoveredEvents = [];
   console.log(`[PARSER] Processing a batch of ${batchToProcess.length} productions.`);
-  debugger;
   for (const productionToProcess of batchToProcess) {
     const { id: productionSeasonId, title: productionTitle } = productionToProcess;
     const currentItemNumber = (jobState.processedIds?.length || 0) + 1;
@@ -219,18 +217,10 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
         body: buttonApiBody
       });
 
-      console.log(`[SEGerstrom DEBUG] BuyButton raw response`, {
+      console.log(`[PARSER] BuyButton response`, {
         productionId: productionSeasonId,
         title: productionTitle,
-        responseType: typeof buttonResponse,
-        responseStatus: buttonResponse?.status,
-        responseKeys: buttonResponse ? Object.keys(buttonResponse) : [],
-        textLength: typeof buttonResponse?.text === 'string'
-          ? buttonResponse.text.length
-          : null,
-        textPreview: typeof buttonResponse?.text === 'string'
-          ? buttonResponse.text.slice(0, 1000)
-          : null,
+        responseStatus: buttonResponse?.status
       });
 
       let button = {};
@@ -248,7 +238,12 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
         }
       }
 
-      const firstOnSaleSubItem = button?.SubItems?.find(si => si.Status === 'OnSale' && si.TicketCount !== 0);
+      const onSalePerformanceIds = new Set(
+        (button?.SubItems || [])
+          .filter(item => item.Status === 'OnSale' && Number(item.TicketCount) > 0)
+          .map(item => String(item.ItemId))
+      );
+      const firstOnSaleSubItem = button?.SubItems?.find(si => onSalePerformanceIds.has(String(si.ItemId)));
       
       if (firstOnSaleSubItem) {
         const representativePerformanceId = firstOnSaleSubItem.ItemId.toString();
@@ -257,11 +252,14 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
 
         console.log(`[PARSER] Fetching settings for production "${productionTitle}" via performanceId: ${representativePerformanceId}`);
         const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET' });
+        if (settingsPayload.status < 200 || settingsPayload.status >= 300) {
+          throw new Error(`Settings API returned HTTP ${settingsPayload.status}.`);
+        }
         const settingsData = JSON.parse(settingsPayload.text || '{}');
 
         if (settingsData.additionalPerformances) {
           for (const p of settingsData.additionalPerformances) {
-            if (p.hasAvailability && p.performanceId && p.performanceDate) {
+            if (p.performanceId && p.performanceDate && onSalePerformanceIds.has(String(p.performanceId))) {
               allDiscoveredEvents.push({
                 showName: p.description || `Performance ${p.performanceId}`,
                 showtime: p.performanceDate.replace('T', ' '),
@@ -290,8 +288,8 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
     jobState.processedIds.push(productionSeasonId);
   }
 
-  // Update the job state before finishing.
-  await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
+  // Persist events before checkpointing the queue. If persistence fails, the
+  // batch will safely be retried on the next run instead of being lost.
   const upsertResult = await upsertDiscoveredEvents(env.DB, allDiscoveredEvents);
   jobState.totalEventsDiscovered = (jobState.totalEventsDiscovered || 0) + (upsertResult.inserted || 0);
   await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
