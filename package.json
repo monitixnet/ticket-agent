@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test tests/worker-scenarios.test.mjs",
-    "dev:segerstrom": "wrangler dev --config wrangler.venue.segerstrom.jsonc",
-    "deploy:segerstrom": "wrangler deploy --config wrangler.venue.segerstrom.jsonc"
+    "dev:segerstrom": "wrangler dev",
+    "deploy:segerstrom": "wrangler deploy"
   },
   "repository": {
     "type": "git",

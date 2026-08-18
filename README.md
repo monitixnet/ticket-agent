@@ -10,7 +10,7 @@ Strategy names are intentionally allowlisted in code; D1 selects an approved str
 
 ## Local setup
 
-Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The Worker uses a Cloudflare D1 database configured by its venue-specific Wrangler file.
+Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The Worker uses a Cloudflare D1 database configured in `wrangler.jsonc`.
 
 ```bash
 # Example .dev.vars
@@ -82,7 +82,7 @@ npx wrangler d1 migrations apply ticket-agent-db --remote
 npx wrangler d1 execute ticket-agent-db --remote --file=database/seed.sql
 ```
 
-Before enabling Segerstrom, set its credential as a Worker secret (not in `wrangler.venue.segerstrom.jsonc` or D1):
+Before enabling Segerstrom, set its credential as a Worker secret (not in `wrangler.jsonc` or D1):
 
 ```bash
 npx wrangler secret put ALGOLIA_SEGERSTROM_API_KEY
@@ -167,7 +167,7 @@ The following are explicit non-goals for this phase and must remain true:
 
 ### Segerstrom Worker
 
-`wrangler.venue.segerstrom.jsonc` is the deployment configuration for the Segerstrom Worker. It names that Worker `ticket-agent-segerstrom` and binds it to only `segerstrom_center` through `WORKER_VENUE_ID`.
+`wrangler.jsonc` is the deployment configuration for the Segerstrom Worker. It names that Worker `ticket-agent-segerstrom` and binds it to only `segerstrom_center` through `WORKER_VENUE_ID`.
 
 ```bash
 npm run deploy:segerstrom
