@@ -1,7 +1,118 @@
 import { VENUE_PARSERS } from './venue-rules.js';
-import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState } from './database/queries.js';
-import { ACTIVE_VENUE_ADAPTERS } from './venue-config.js';
+import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, recordDiscoveryBatchMetric } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
+import { isMonitoringWindowActive } from './venue-logic.js';
+
+const DISCOVERY_OUTCOMES = ['on_sale', 'sold_out', 'future_sale', 'past', 'not_on_sale', 'free_no_tickets', 'settings_unavailable', 'unknown', 'error'];
+const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
+
+function emptyDiscoveryOutcomeCounts() {
+  return Object.fromEntries(DISCOVERY_OUTCOMES.map(outcome => [outcome, 0]));
+}
+
+function classifyDiscoveryOutcome(button, onSalePerformanceIds, now = new Date()) {
+  if (onSalePerformanceIds.size > 0) return 'on_sale';
+  const maxDate = Date.parse(button?.MaxDate || button?.MOSEndDate || '');
+  if (Number.isFinite(maxDate) && maxDate < now.getTime()) return 'past';
+  const status = String(button?.Status || '').toLowerCase();
+  const subItems = Array.isArray(button?.SubItems) ? button.SubItems : [];
+  if (status === 'pastsale') return 'past';
+  if (status === 'soldout' || (subItems.length && subItems.every(item => String(item.Status).toLowerCase() === 'soldout'))) return 'sold_out';
+  if (status === 'freenotixs') return 'free_no_tickets';
+  const saleStart = Date.parse(button?.MOSStartDate || '');
+  if (Number.isFinite(saleStart) && saleStart > now.getTime()) return 'future_sale';
+  if (status === 'notonsale' || status === 'offsale') return 'not_on_sale';
+  return 'unknown';
+}
+
+function firstNonEmptyString(values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function extractHallFromRecord(record) {
+  if (!record || typeof record !== 'object') return null;
+  const directHall = firstNonEmptyString([
+    record.venueHall, record.hallName, record.hall,
+    record.venueName, record.facilityName, record.locationName
+  ]);
+  if (directHall) return directHall;
+
+  for (const nestedValue of [record.venue, record.facility, record.location, record.performanceVenue, record.performanceLocation]) {
+    if (typeof nestedValue === 'string' && nestedValue.trim()) return nestedValue.trim();
+    if (nestedValue && typeof nestedValue === 'object') {
+      const nestedHall = firstNonEmptyString([nestedValue.name, nestedValue.hallName, nestedValue.venueName, nestedValue.facilityName, nestedValue.description]);
+      if (nestedHall) return nestedHall;
+    }
+  }
+  return null;
+}
+
+// Tessitura/SeatMe payloads vary by venue and version. Prefer the performance
+// record because one production can play multiple halls; use facility settings
+// only as a fallback and leave the value null when the API does not identify it.
+export function resolveVenueHall(performance, settingsData) {
+  return extractHallFromRecord(performance)
+    || extractHallFromRecord(settingsData)
+    || extractHallFromRecord(settingsData?.facilitySettings)
+    || null;
+}
+
+function buildUnknownOutcomeSample(productionId, title, button, responseStatus) {
+  const subItemStatusCounts = (Array.isArray(button?.SubItems) ? button.SubItems : [])
+    .reduce((counts, item) => {
+      const status = String(item?.Status || 'missing');
+      counts[status] = (counts[status] || 0) + 1;
+      return counts;
+    }, {});
+  return {
+    productionId,
+    title,
+    overallStatus: button?.Status || null,
+    responseStatus: responseStatus ?? null,
+    subItemStatusCounts
+  };
+}
+
+function buildDiscoverySummaryMessage(adapterName, jobState, insertedCount, discoveredCount, runtimeMs) {
+  const processed = jobState.processedProductions ?? jobState.processedIds?.length ?? 0;
+  const remaining = jobState.remainingProductions ?? jobState.productionQueue?.length ?? 0;
+  const total = jobState.totalProductions ?? Math.max(processed + remaining, 0);
+  const complete = Boolean(jobState.complete);
+
+  return [
+    `Discovery summary - ${adapterName}`,
+    `status: ${complete ? 'COMPLETE' : 'IN_PROGRESS'}`,
+    `processed: ${processed}`,
+    `remaining: ${remaining}`,
+    `total: ${total}`,
+    `new events: ${insertedCount}`,
+    `discovered this batch: ${discoveredCount}`,
+    `runtime_ms: ${runtimeMs ?? 0}`,
+    `last_updated: ${jobState.lastUpdatedAt || new Date().toISOString()}`,
+  ].join('\n');
+}
+
+function sendDiscoveryStatusToTelegram(env, ctx, adapterName, jobState, insertedCount, discoveredCount, runtimeMs) {
+  const url = env.NOTIFICATION_OUTBOUND_URL;
+  if (!url) return;
+  const message = buildDiscoverySummaryMessage(adapterName, jobState, insertedCount, discoveredCount, runtimeMs);
+  const promise = fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: `\`\`\`\n${message}\n\`\`\`` })
+  }).catch(err => console.error(`[TELEGRAM DISCOVERY SUMMARY FAILED] ${err.message}`));
+  ctx?.waitUntil?.(promise);
+}
+
+function shouldSendDiscoveryStatusNotification(env, complete = false) {
+  const flag = (env.DISCOVERY_SUMMARY_NOTIFICATIONS || '').toLowerCase();
+  if (flag === 'true') return true;
+  if (flag === 'false') return false;
+  return complete || env.ENABLE_DEBUG_NOTIFICATIONS === 'true';
+}
 
 export async function singleStepParseStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, _trackWorkerLog) {
   const parser = VENUE_PARSERS[targetRow.venue_id];
@@ -72,7 +183,8 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     // Step 5: Pass the combined seat and price data to the final parser
     const finalPayload = { seats: allSeatData, prices: zonePriceMap };
     const parser = VENUE_PARSERS[targetRow.venue_id];
-    return parser(JSON.stringify(finalPayload), targetRow.venue_id);
+    return parser(JSON.stringify(finalPayload), targetRow.venue_id)
+      .map(item => ({ ...item, eventId: String(targetRow.event_id || performanceId) }));
   } catch (err) {
     console.error(`[PARSER - ${adapter.venueName}] Failed during API fetch for performanceId ${performanceId}: ${err.message}`);
     throw err;
@@ -130,6 +242,7 @@ export async function calendarPageDiscoveryStrategy(targetRow, htmlBody, env, ct
               showtime: p.performanceDate?.replace('T', ' '),
               eventId: p.performanceId,
               venueId: targetRow.venue_id,
+              venueHall: resolveVenueHall(p, settingsData),
               eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
             });
           }
@@ -154,8 +267,10 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
   let initialQueueSize = 0;
   let jobState = await getDiscoveryJobState(env.DB, JOB_KEY);
 
-  // If no job is in progress, start a new one by fetching all production IDs from Algolia.
-  if (!jobState || !jobState.productionQueue?.length) {
+  // Start only when there is no saved job. An existing job with an empty queue
+  // must reach the completion branch below so it can log completion and clear
+  // its checkpoint instead of silently restarting discovery.
+  if (!jobState) {
     console.log(`[PARSER] No active discovery job found. Starting a new one.`);
     const { algoliaAppId, algoliaApiKey, algoliaIndexName } = adapter;
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
@@ -186,30 +301,86 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
     if (page < totalPages) {
       trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Discovery stopped at configured page limit.`, { maxPages, totalPages });
     }
-    jobState = { productionQueue, processedIds: [], totalEventsDiscovered: 0 };
+    jobState = {
+      productionQueue,
+      processedIds: [],
+      totalEventsDiscovered: 0,
+      totalProductions: productionQueue.length,
+      processedProductions: 0,
+      remainingProductions: productionQueue.length,
+      complete: false,
+      lastUpdatedAt: new Date().toISOString(),
+      productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
+      unknownOutcomeSamples: [],
+      runCount: 0,
+    };
     initialQueueSize = productionQueue.length;
     console.log(`[PARSER] Created new discovery job with ${productionQueue.length} productions.`);
   } else {
     initialQueueSize = (jobState.productionQueue?.length || 0) + (jobState.processedIds?.length || 0);
+    jobState.totalProductions = jobState.totalProductions || initialQueueSize;
+    jobState.processedProductions = jobState.processedIds?.length || 0;
+    jobState.remainingProductions = jobState.productionQueue.length;
+    jobState.complete = Boolean(jobState.complete) || jobState.productionQueue.length === 0;
+    jobState.productionOutcomeCounts = { ...emptyDiscoveryOutcomeCounts(), ...(jobState.productionOutcomeCounts || {}) };
+    jobState.unknownOutcomeSamples = Array.isArray(jobState.unknownOutcomeSamples)
+      ? jobState.unknownOutcomeSamples.slice(0, UNKNOWN_OUTCOME_SAMPLE_LIMIT)
+      : [];
+    jobState.runCount = Number(jobState.runCount) || 0;
     console.log(`[PARSER] Resuming discovery job with ${jobState.productionQueue.length} productions remaining.`);
   }
 
-  const BATCH_SIZE = 20; // A more aggressive batch size to accelerate discovery.
+  // Process a polite, bounded chunk per scheduled invocation. This remains
+  // sequential within the batch to avoid bursts against the venue.
+  const BATCH_SIZE = Math.max(1, Math.min(Number(adapter.discoveryBatchSize ?? env.DISCOVERY_BATCH_SIZE) || 30, 50));
+  const totalRemainingBeforeBatch = jobState.productionQueue.length + (jobState.processedIds?.length || 0);
   const batchToProcess = jobState.productionQueue.splice(0, BATCH_SIZE);
 
   if (!batchToProcess.length) {
-    console.log(`[PARSER] Discovery job complete. All productions processed.`);
+    jobState.processedProductions = jobState.processedIds?.length || 0;
+    jobState.remainingProductions = jobState.productionQueue.length;
+    jobState.complete = true;
+    jobState.lastUpdatedAt = new Date().toISOString();
+    console.log(`[PARSER] Discovery job complete. All productions processed. totalCompleted=${jobState.processedProductions}, totalRemaining=0, totalQueued=${jobState.productionQueue.length}, totalKnown=${jobState.totalProductions || jobState.processedProductions}, totalRuns=${jobState.runCount || 0}`);
     trackWorkerLog(env, ctx, 'info', `[PARSER - ${adapter.venueName}] Discovery job finished. A total of ${jobState.totalEventsDiscovered} events were discovered.`, {
       finalEventCount: jobState.totalEventsDiscovered,
+      totalCompleted: jobState.processedProductions,
+      totalRemaining: 0,
+      totalQueued: jobState.productionQueue.length,
+      totalKnown: jobState.totalProductions || jobState.processedProductions,
+      complete: true,
     });
+    if (shouldSendDiscoveryStatusNotification(env, true)) {
+      sendDiscoveryStatusToTelegram(env, ctx, adapter.venueName, jobState, 0, 0, 0);
+    }
+    await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
     await clearDiscoveryJobState(env.DB, JOB_KEY);
     return [];
   }
 
+  const jobRunNumber = jobState.runCount + 1;
+  const estimatedInitialRuns = Math.ceil((jobState.totalProductions || totalRemainingBeforeBatch) / BATCH_SIZE);
+  console.log(`[PARSER] Discovery progress: run=${jobRunNumber}/${estimatedInitialRuns}, completed=${jobState.processedIds?.length || 0}, remainingInQueue=${jobState.productionQueue.length}, batchSize=${BATCH_SIZE}, totalKnown=${totalRemainingBeforeBatch}, complete=${jobState.complete || false}`);
+
   const allDiscoveredEvents = [];
+  const processedThisRun = [];
+  const batchStartedAt = Date.now();
+  const batchStartedAtIso = new Date(batchStartedAt).toISOString();
+  let failedProductionCount = 0;
+  const batchOutcomeCounts = emptyDiscoveryOutcomeCounts();
+  const unknownOutcomeSamplesInRun = [];
   console.log(`[PARSER] Processing a batch of ${batchToProcess.length} productions.`);
-  for (const productionToProcess of batchToProcess) {
+  for (let batchIndex = 0; batchIndex < batchToProcess.length; batchIndex++) {
+    if (!isMonitoringWindowActive(new Date(), adapter.timezoneName, adapter.businessHours)) {
+      const deferredProductions = batchToProcess.slice(batchIndex);
+      jobState.productionQueue.unshift(...deferredProductions);
+      console.log(`[PARSER] Curfew reached for ${adapter.venueName}; checkpointing ${deferredProductions.length} unprocessed production(s) for the next allowed window.`);
+      break;
+    }
+
+    const productionToProcess = batchToProcess[batchIndex];
     const { id: productionSeasonId, title: productionTitle } = productionToProcess;
+    let productionOutcome = 'unknown';
     const currentItemNumber = (jobState.processedIds?.length || 0) + 1;
     console.log(`\n[PARSER] Processing production ${currentItemNumber} of ${initialQueueSize}: "${productionTitle}" (ID: ${productionSeasonId})`);
 
@@ -251,33 +422,63 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
         }
       }
 
-      const onSalePerformanceIds = new Set(
+      const onSalePerformanceIdList = [...new Set(
         (button?.SubItems || [])
           .filter(item => item.Status === 'OnSale' && Number(item.TicketCount) > 0)
           .map(item => normalizeExternalId(item.ItemId))
-      );
-      const firstOnSaleSubItem = button?.SubItems?.find(si => onSalePerformanceIds.has(normalizeExternalId(si.ItemId)));
-      
-      if (firstOnSaleSubItem) {
-        const representativePerformanceId = normalizeExternalId(firstOnSaleSubItem.ItemId);
-        const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', representativePerformanceId);
-        if (!settingsUrl) throw new Error('settingsApiUrlPattern is not configured in the adapter.');
-
-        console.log(`[PARSER] Fetching settings for production "${productionTitle}" via performanceId: ${representativePerformanceId}`);
-        const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
-        if (settingsPayload.status < 200 || settingsPayload.status >= 300) {
-          throw new Error(`Settings API returned HTTP ${settingsPayload.status}.`);
+      )];
+      const onSalePerformanceIds = new Set(onSalePerformanceIdList);
+      productionOutcome = classifyDiscoveryOutcome(button, onSalePerformanceIds);
+      if (productionOutcome === 'unknown') {
+        const sample = buildUnknownOutcomeSample(productionSeasonId, productionTitle, button, buttonResponse.status);
+        unknownOutcomeSamplesInRun.push(sample);
+        if (jobState.unknownOutcomeSamples.length < UNKNOWN_OUTCOME_SAMPLE_LIMIT) {
+          jobState.unknownOutcomeSamples.push(sample);
         }
+        console.warn(`[PARSER] Unclassified discovery outcome for production ${productionSeasonId} ("${productionTitle}").`, sample);
+      }
+      
+      if (onSalePerformanceIdList.length) {
+        let settingsPayload = null;
+        let representativePerformanceId = null;
+        for (const performanceId of onSalePerformanceIdList) {
+          const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', performanceId);
+          if (!settingsUrl) throw new Error('settingsApiUrlPattern is not configured in the adapter.');
+
+          console.log(`[PARSER] Fetching settings for production "${productionTitle}" via performanceId: ${performanceId}`);
+          const candidatePayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
+          if (candidatePayload.status >= 200 && candidatePayload.status < 300) {
+            settingsPayload = candidatePayload;
+            representativePerformanceId = performanceId;
+            break;
+          }
+          if (candidatePayload.status !== 404) {
+            throw new Error(`Settings API returned HTTP ${candidatePayload.status}.`);
+          }
+          console.warn(`[PARSER] Settings API returned 404 for performanceId ${performanceId}; trying another on-sale performance if available.`);
+        }
+
+        if (!settingsPayload) {
+          productionOutcome = 'settings_unavailable';
+          trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] On-sale production has no resolvable settings performance.`, {
+            productionId: productionSeasonId,
+            onSalePerformanceIds: onSalePerformanceIdList
+          });
+        } else {
         const settingsData = JSON.parse(settingsPayload.text || '{}');
         const additionalPerformances = Array.isArray(settingsData.additionalPerformances)
           ? settingsData.additionalPerformances
           : [];
+        const performanceHalls = additionalPerformances
+          .map(performance => resolveVenueHall(performance, settingsData));
         console.log(`[PARSER] Settings response summary`, {
           productionId: productionSeasonId,
           responseStatus: settingsPayload.status,
           routedVia: settingsPayload.routedVia,
           additionalPerformanceCount: additionalPerformances.length,
-          onSalePerformanceCount: onSalePerformanceIds.size
+          onSalePerformanceCount: onSalePerformanceIds.size,
+          venueHalls: [...new Set(performanceHalls.filter(Boolean))],
+          performancesMissingVenueHall: performanceHalls.filter(hall => !hall).length
         });
 
         if (additionalPerformances.length) {
@@ -288,10 +489,12 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
                 showtime: p.performanceDate.replace('T', ' '),
                 eventId: normalizeExternalId(p.performanceId),
                 venueId: targetRow.venue_id,
+                venueHall: resolveVenueHall(p, settingsData),
                 eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
               });
             }
           }
+        }
         }
       } else {
         // Enhance logging to summarize the statuses of sub-items if they exist.
@@ -306,26 +509,100 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
         console.log(`[PARSER] Skipping production ${productionSeasonId} ("${productionTitle}") because its overall status is "${button.Status}" (HTTP: ${buttonResponse.status}) and no on-sale performances were found (${subItemSummary}).`);
       }
     } catch (err) {
+      failedProductionCount += 1;
+      productionOutcome = 'error';
       console.error(`[PARSER - ${adapter.venueName}] Production ${productionSeasonId} failed: ${err.message}`);
       trackWorkerLog(env, ctx, 'error', `[PARSER - ${adapter.venueName}] Unhandled error processing production hit.`, { productionId: productionSeasonId, title: productionTitle, error: err.message });
     }
+    batchOutcomeCounts[productionOutcome] += 1;
+    jobState.productionOutcomeCounts = { ...emptyDiscoveryOutcomeCounts(), ...(jobState.productionOutcomeCounts || {}) };
+    jobState.productionOutcomeCounts[productionOutcome] += 1;
     jobState.processedIds.push(productionSeasonId);
+    processedThisRun.push(productionSeasonId);
   }
 
   // Persist events before checkpointing the queue. If persistence fails, the
   // batch will safely be retried on the next run instead of being lost.
   const upsertResult = await upsertDiscoveredEvents(env.DB, allDiscoveredEvents);
   jobState.totalEventsDiscovered = (jobState.totalEventsDiscovered || 0) + (upsertResult.inserted || 0);
+  jobState.processedProductions = jobState.processedIds.length;
+  jobState.remainingProductions = jobState.productionQueue.length;
+  jobState.totalProductions = jobState.totalProductions || initialQueueSize;
+  jobState.runCount = jobRunNumber;
+  jobState.complete = jobState.productionQueue.length === 0;
+  jobState.lastUpdatedAt = new Date().toISOString();
   await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
+
+  const batchDurationMs = Date.now() - batchStartedAt;
+  const batchCompletedAtIso = new Date().toISOString();
+  const averageMsPerProduction = processedThisRun.length
+    ? Math.round(batchDurationMs / processedThisRun.length)
+    : 0;
+  const estimatedRunsRemaining = Math.ceil(jobState.productionQueue.length / BATCH_SIZE);
+  console.log(`[PARSER] Discovery batch metrics`, {
+    processedProductions: processedThisRun.length,
+    discoveredEvents: allDiscoveredEvents.length,
+    insertedEvents: upsertResult.inserted,
+    durationMs: batchDurationMs,
+    averageMsPerProduction,
+    outcomes: batchOutcomeCounts,
+    unknownOutcomeSamples: unknownOutcomeSamplesInRun,
+    jobRunNumber,
+    estimatedRunsRemaining
+  });
+
+  await recordDiscoveryBatchMetric(env.DB, {
+    id: `discovery:${targetRow.venue_id}:${batchStartedAt}:${crypto.randomUUID()}`,
+    venueId: targetRow.venue_id,
+    startedAt: batchStartedAtIso,
+    completedAt: batchCompletedAtIso,
+    durationMs: batchDurationMs,
+    processedProductionCount: processedThisRun.length,
+    discoveredEventCount: allDiscoveredEvents.length,
+    insertedEventCount: upsertResult.inserted || 0,
+    failedProductionCount,
+    remainingProductionCount: jobState.productionQueue.length,
+    totalProductionCount: initialQueueSize,
+    outcomeCounts: batchOutcomeCounts,
+    jobRunNumber,
+    estimatedRunsRemaining
+  });
 
   trackWorkerLog(env, ctx, 'info', `[PARSER - ${adapter.venueName}] Discovery run finished. Found ${upsertResult.inserted} new events.`, {
     venueId: targetRow.venue_id,
     strategy: 'segerstromProductionDiscovery',
-    processedProductionsInRun: batchToProcess.map(p => p.id),
+    processedProductionsInRun: processedThisRun,
     newEventsInRun: upsertResult.inserted,
+    discoveredEventsInRun: allDiscoveredEvents.length,
+    processedProductionCount: processedThisRun.length,
+    durationMs: batchDurationMs,
+    averageMsPerProduction,
+    failedProductionCount,
     totalEventsDiscoveredInJob: jobState.totalEventsDiscovered,
     productionsRemaining: jobState.productionQueue.length,
+    complete: jobState.productionQueue.length === 0,
+    totalProductions: jobState.totalProductions || initialQueueSize,
+    processedProductions: jobState.processedProductions,
+    remainingProductions: jobState.productionQueue.length,
+    lastUpdatedAt: jobState.lastUpdatedAt,
+    outcomeCountsInRun: batchOutcomeCounts,
+    outcomeCountsInJob: jobState.productionOutcomeCounts,
+    unknownOutcomeSamplesInRun,
+    unknownOutcomeSamplesInJob: jobState.unknownOutcomeSamples,
+    jobRunNumber,
+    totalJobRuns: jobState.runCount,
+    estimatedRunsRemaining,
   });
+  if (shouldSendDiscoveryStatusNotification(env, jobState.productionQueue.length === 0)) {
+    sendDiscoveryStatusToTelegram(env, ctx, adapter.venueName, jobState, upsertResult.inserted || 0, allDiscoveredEvents.length, batchDurationMs);
+  }
+  if (jobState.complete) {
+    console.log(`[PARSER] Discovery job complete. All ${jobState.processedProductions} productions processed in ${jobState.runCount} run(s); ${jobState.totalEventsDiscovered} new events discovered.`, {
+      outcomes: jobState.productionOutcomeCounts,
+      unknownOutcomeSamples: jobState.unknownOutcomeSamples
+    });
+    await clearDiscoveryJobState(env.DB, JOB_KEY);
+  }
   return [];
 }
 
@@ -407,6 +684,7 @@ export async function algoliaDiscoveryStrategy(targetRow, _htmlBody, env, ctx, e
                       showtime: p.performanceDate?.replace('T', ' '),
                       eventId: p.performanceId,
                       venueId: targetRow.venue_id,
+                      venueHall: resolveVenueHall(p, settingsData),
                       eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
                     });
                   }

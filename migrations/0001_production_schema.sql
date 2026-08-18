@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS worker_logs (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shows_venue_name ON shows(venue_id, show_name);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_skybox_listing_id ON listings(skybox_listing_id);
 CREATE INDEX IF NOT EXISTS idx_events_showtime ON events(showtime);

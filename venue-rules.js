@@ -139,3 +139,101 @@ export function evaluateEquivalentInventoryCoverage(targetSeat, inventory = []) 
     equivalentMatches: matches
   };
 }
+
+// A sellable multi-ticket recommendation must be one contiguous run in a
+// single row. Blocks are deliberately non-overlapping so a nine-seat run does
+// not masquerade as multiple independent six-seat backup options.
+export function findContiguousSeatBlocks(targetPool, inventory = []) {
+  const target = normalizeInventoryItem(targetPool);
+  const quantity = Math.max(1, Number(target.quantity || 1));
+  const byRow = new Map();
+  for (const candidate of inventory.map(normalizeInventoryItem)) {
+    if (!isEquivalentInventoryMatch(target, candidate)) continue;
+    if (!/^\d+$/.test(String(candidate.seat))) continue;
+    const row = String(candidate.row || '').trim();
+    if (!row) continue;
+    const seats = byRow.get(row) || [];
+    seats.push(candidate);
+    byRow.set(row, seats);
+  }
+
+  const blocks = [];
+  for (const [row, rowSeats] of byRow) {
+    const uniqueSeats = [...new Map(rowSeats.map(seat => [Number(seat.seat), seat])).values()]
+      .sort((a, b) => Number(a.seat) - Number(b.seat));
+    let run = [];
+    const flushRun = () => {
+      for (let index = 0; index + quantity <= run.length; index += quantity) {
+        const seats = run.slice(index, index + quantity);
+        blocks.push({ row, seats, startSeat: seats[0].seat, endSeat: seats.at(-1).seat });
+      }
+      run = [];
+    };
+    for (const seat of uniqueSeats) {
+      if (run.length && Number(seat.seat) !== Number(run.at(-1).seat) + 1) flushRun();
+      run.push(seat);
+    }
+    flushRun();
+  }
+  return blocks;
+}
+
+// Segerstrom-only confidence policy. A target block needs two more contiguous,
+// non-overlapping blocks of the same quantity at the same price/quality pool.
+// A backup may be in the target row (same quality) or a lower sort-order row
+// (closer to the stage, therefore better). It never counts a row behind.
+export function findSegerstromBufferedCandidates(inventory = [], quantity, rowOrdering = [], bufferBlockCount = 2) {
+  const requiredBufferBlockCount = Math.max(1, Number(bufferBlockCount) || 2);
+  const rowOrder = new Map(rowOrdering.map(row => [
+    `${String(row.section_name || '').toLowerCase()}|${String(row.row_label || '').toLowerCase()}`,
+    Number(row.sort_order)
+  ]));
+  const representatives = new Map();
+  for (const item of inventory.map(normalizeInventoryItem)) {
+    if (!item.available) continue;
+    const key = [item.section, item.priceLevel, item.seatQuality]
+      .map(value => String(value || '').trim().toLowerCase()).join('|');
+    if (!representatives.has(key)) representatives.set(key, item);
+  }
+
+  const candidates = [];
+  for (const targetPool of representatives.values()) {
+    const blocks = findContiguousSeatBlocks({ ...targetPool, quantity }, inventory);
+    for (const targetBlock of blocks) {
+      const sectionKey = String(targetPool.section).trim().toLowerCase();
+      const targetRowOrder = rowOrder.get(`${sectionKey}|${String(targetBlock.row).trim().toLowerCase()}`);
+      if (!Number.isFinite(targetRowOrder)) continue; // fail closed when hall mapping is absent
+      const bufferBlocks = blocks.filter(block => {
+        if (block === targetBlock) return false;
+        const candidateRowOrder = rowOrder.get(`${sectionKey}|${String(block.row).trim().toLowerCase()}`);
+        return Number.isFinite(candidateRowOrder)
+          && (candidateRowOrder === targetRowOrder || candidateRowOrder < targetRowOrder);
+      });
+      if (bufferBlocks.length < requiredBufferBlockCount) continue;
+      candidates.push({
+        targetQuantity: quantity,
+        section: targetPool.section,
+        row: targetBlock.row,
+        startSeat: targetBlock.startSeat,
+        endSeat: targetBlock.endSeat,
+        priceLevel: targetPool.priceLevel,
+        seatQuality: targetPool.seatQuality,
+        priceCents: targetPool.priceCents,
+        positionZone: 'not_applicable',
+        targetSeats: targetBlock.seats.map(seat => seat.seat),
+        bufferBlocks: bufferBlocks.slice(0, requiredBufferBlockCount).map(block => ({
+          row: block.row,
+          startSeat: block.startSeat,
+          endSeat: block.endSeat,
+          seats: block.seats.map(seat => seat.seat)
+        }))
+      });
+    }
+  }
+  return candidates;
+}
+
+export function isNotApplicableRowPolicy(hallPolicy = {}) {
+  return hallPolicy?.seatPositionPolicy === 'not_applicable_row_forward_only'
+    && hallPolicy?.seatPositionZone === 'not_applicable';
+}

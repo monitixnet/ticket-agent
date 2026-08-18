@@ -3,34 +3,33 @@ import test from 'node:test';
 
 import {
   buildHumanReviewNotification,
+  filterInventoryForDropPriceRule,
   default as worker,
 } from '../index.js';
 import {
   isMonitoringWindowActive,
   getScheduleModeForCronDate,
   inferVenueTimeZone,
-  resolveVenuePolicy,
   buildVenueAdapterSmokeReport,
   isSmokeMatrixReady,
   buildOperationalTelemetrySnapshot,
-  resolveVenueAdapter,
   isBlockLikeStatus,
   computeBackoffDelayMs,
   isSkyboxListingEnabled,
 } from '../venue-logic.js';
 import {
-  ACTIVE_VENUE_SET,
-  ACTIVE_VENUE_SMOKE_MATRIX,
-} from '../venue-config.js';
-import {
   parseSegerstromInventoryDocument,
   evaluateEquivalentInventoryCoverage,
   isSpecificSeatMatch,
   isPriceParityMatch,
+  findContiguousSeatBlocks,
+  findSegerstromBufferedCandidates,
+  isNotApplicableRowPolicy,
 } from '../venue-rules.js';
 import {
   segerstromDrillDownStrategy,
-  segerstromProductionDiscoveryStrategy
+  segerstromProductionDiscoveryStrategy,
+  resolveVenueHall
 } from '../strategies.js';
 import {
   getNextUpcomingEvent,
@@ -39,8 +38,16 @@ import {
   upsertDiscoveredEvents,
 } from '../database/queries.js';
 import { normalizeExternalId } from '../utils.js';
+import { getActiveVenueAdapters } from '../database/venue-runtime-config.js';
 
 const WEBHOOK_SECRET = 'test-shared-secret';
+const TEST_ADAPTERS = [{
+  venueId: 'segerstrom_center', venueName: 'Segerstrom Center for the Arts',
+  timezoneName: 'America/Los_Angeles', securityTier: 'high', active: true,
+  monitoringOnly: true, listingApprovalAllowed: false, baseIntervalMs: 120000,
+  maxIntervalMs: 600000, requiredInventoryFields: ['eventId'],
+  smokeChecks: ['time_window']
+}];
 
 const run = async () => {
   test('business window is open for Los Angeles during active hours', () => {
@@ -69,19 +76,101 @@ const run = async () => {
     assert.equal(result.equivalentInventoryCount, 6);
   });
 
+  test('contiguous seat blocks stay in one row and do not overlap', () => {
+    const inventory = ['1', '2', '3', '4', '5', '6', '7', '8', '9'].map(seat => ({
+      venueId: 'venue', eventId: 'event', section: 'Orchestra', row: 'A', seat,
+      priceLevel: 'tier', seatQuality: 'standard', available: true
+    }));
+    const blocks = findContiguousSeatBlocks({
+      venueId: 'venue', eventId: 'event', section: 'Orchestra', priceLevel: 'tier', seatQuality: 'standard', quantity: 2
+    }, inventory);
+    assert.deepEqual(blocks.map(block => block.seats.map(seat => seat.seat)), [['1', '2'], ['3', '4'], ['5', '6'], ['7', '8']]);
+  });
+
+  test('Segerstrom candidates require two same-or-forward-row buffer blocks', () => {
+    const makeSeats = (row, start) => Array.from({ length: 6 }, (_, index) => ({
+      venueId: 'segerstrom_center', eventId: 'event', section: 'Orchestra', row,
+      seat: String(start + index), priceLevel: 'tier', seatQuality: 'standard', priceCents: 5000, available: true
+    }));
+    const inventory = [
+      ...makeSeats('D', 1), ...makeSeats('D', 20),
+      ...makeSeats('C', 1), ...makeSeats('E', 1)
+    ];
+    const candidates = findSegerstromBufferedCandidates(inventory, 6, [
+      { section_name: 'orchestra', row_label: 'B', sort_order: 2 },
+      { section_name: 'orchestra', row_label: 'C', sort_order: 3 },
+      { section_name: 'orchestra', row_label: 'D', sort_order: 4 },
+      { section_name: 'orchestra', row_label: 'E', sort_order: 5 }
+    ]);
+    const rowDTarget = candidates.find(candidate => candidate.row === 'D' && candidate.startSeat === '1');
+    assert.ok(rowDTarget);
+    assert.deepEqual(rowDTarget.bufferBlocks.map(block => block.row), ['D', 'C']);
+    assert.equal(candidates.some(candidate => candidate.row === 'C' && candidate.bufferBlocks.some(block => block.row === 'D')), false);
+    const oneBufferInventory = [
+      ...makeSeats('D', 1), ...makeSeats('C', 1)
+    ];
+    const oneBufferCandidates = findSegerstromBufferedCandidates(oneBufferInventory, 6, [
+      { section_name: 'orchestra', row_label: 'B', sort_order: 2 },
+      { section_name: 'orchestra', row_label: 'C', sort_order: 3 },
+      { section_name: 'orchestra', row_label: 'D', sort_order: 4 },
+      { section_name: 'orchestra', row_label: 'E', sort_order: 5 }
+    ], 1);
+    assert.equal(oneBufferCandidates.length, 1);
+    assert.equal(oneBufferCandidates[0].bufferBlocks.length, 1);
+
+    const sameRowOnlyCandidates = findSegerstromBufferedCandidates([
+      ...makeSeats('D', 1), ...makeSeats('D', 20)
+    ], 6, [{ section_name: 'orchestra', row_label: 'D', sort_order: 4 }], 1);
+    assert.equal(sameRowOnlyCandidates.length, 2);
+    assert.deepEqual(sameRowOnlyCandidates[0].bufferBlocks[0].seats, ['20', '21', '22', '23', '24', '25']);
+    assert.equal(isNotApplicableRowPolicy({
+      seatPositionPolicy: 'not_applicable_row_forward_only', seatPositionZone: 'not_applicable'
+    }), true);
+    assert.equal(isNotApplicableRowPolicy({
+      seatPositionPolicy: 'not_applicable_row_forward_only', seatPositionZone: 'center'
+    }), false);
+  });
+
   test('external numeric IDs discard only a decimal-zero suffix', () => {
     assert.equal(normalizeExternalId('31946.0'), '31946');
     assert.equal(normalizeExternalId('00123'), '00123');
     assert.equal(normalizeExternalId('section-A'), 'section-A');
   });
 
-  test('venue timezone inference resolves Segerstrom to Los Angeles', () => {
-    assert.equal(inferVenueTimeZone('Segerstrom Center', 'CA', null), 'America/Los_Angeles');
+  test('discovery hall resolution prefers a performance-specific hall over a venue fallback', () => {
+    assert.equal(resolveVenueHall(
+      { venueName: 'Samueli Theater' },
+      { facilitySettings: { facilityName: 'Segerstrom Hall' } }
+    ), 'Samueli Theater');
+    assert.equal(resolveVenueHall(
+      {},
+      { facilitySettings: { facilityName: 'Segerstrom Hall' } }
+    ), 'Segerstrom Hall');
+    assert.equal(resolveVenueHall({}, {}), null);
   });
 
-  test('primary market scan is selected at minute 12', () => {
-    const date = new Date(Date.UTC(2026, 7, 3, 0, 12, 0));
-    assert.equal(getScheduleModeForCronDate(date), 'primary_scan');
+  test('venue timezone inference uses the persisted venue timezone', () => {
+    assert.equal(inferVenueTimeZone('Segerstrom Center', 'CA', 'America/Los_Angeles'), 'America/Los_Angeles');
+  });
+
+  test('inventory scan is selected at minute 9', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 9, 0));
+    assert.equal(getScheduleModeForCronDate(date), 'inventory_scan');
+  });
+
+  test('drop watch is selected every five minutes', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 10, 0));
+    assert.equal(getScheduleModeForCronDate(date), 'drop_watch');
+  });
+
+  test('price-bounded drop watch counts only seats at or below its cap', () => {
+    const qualifying = filterInventoryForDropPriceRule([
+      { priceCents: 16999 },
+      { priceCents: 17000 },
+      { priceCents: 17001 },
+      { priceCents: null }
+    ], 17000);
+    assert.deepEqual(qualifying.map(item => item.priceCents), [16999, 17000]);
   });
 
   test('listing watcher is selected at minute 17', () => {
@@ -89,8 +178,8 @@ const run = async () => {
     assert.equal(getScheduleModeForCronDate(date), 'listing_watch');
   });
 
-  test('discovery scan is selected at minute 22', () => {
-    const date = new Date(Date.UTC(2026, 7, 3, 0, 22, 0));
+  test('discovery scan is selected at minute 7', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 7, 0));
     assert.equal(getScheduleModeForCronDate(date), 'discovery_scan');
   });
 
@@ -136,34 +225,14 @@ const run = async () => {
     assert.equal(response.status, 401);
   });
 
-  test('active venue set includes only the configured production venue', () => {
-    assert.deepEqual(ACTIVE_VENUE_SET, [
-      'segerstrom_center'
-    ]);
-    assert.equal(ACTIVE_VENUE_SET.includes('grand_ole_opry'), false);
-    assert.equal(ACTIVE_VENUE_SET.includes('broadway_com'), false);
-    assert.equal(ACTIVE_VENUE_SET.includes('broadwaydirect_com'), false);
-  });
-
-  test('source policy resolves active venue settings and enforces a safe backoff schedule', () => {
-    const policy = resolveVenuePolicy('segerstrom_center');
-    assert.equal(policy.active, true);
-    assert.equal(policy.venueId, 'segerstrom_center');
-    assert.equal(policy.baseIntervalMs, 120000);
-    assert.equal(policy.maxIntervalMs, 600000);
-    assert.equal(policy.reason, null);
-  });
-
-  test('the active-venue smoke matrix is monitoring-only', () => {
-    assert.equal(ACTIVE_VENUE_SMOKE_MATRIX.length, 1);
-    assert.equal(ACTIVE_VENUE_SET.length, 1);
-    assert.equal(isSmokeMatrixReady(), true);
-    assert.equal(buildVenueAdapterSmokeReport().every(entry => entry.monitoringOnly === true), true);
-    assert.equal(buildVenueAdapterSmokeReport().every(entry => entry.outboundApprovalEnabled === false), true);
+  test('the runtime venue adapter smoke matrix is monitoring-only', () => {
+    assert.equal(isSmokeMatrixReady(TEST_ADAPTERS), true);
+    assert.equal(buildVenueAdapterSmokeReport(TEST_ADAPTERS).every(entry => entry.monitoringOnly === true), true);
+    assert.equal(buildVenueAdapterSmokeReport(TEST_ADAPTERS).every(entry => entry.outboundApprovalEnabled === false), true);
   });
 
   test('operational telemetry exposes a summary snapshot for each active venue', () => {
-    const snapshot = buildOperationalTelemetrySnapshot(new Date('2026-08-03T15:00:00-07:00'), { ALLOW_SKYBOX_LISTING: 'false' });
+    const snapshot = buildOperationalTelemetrySnapshot(new Date('2026-08-03T15:00:00-07:00'), { ALLOW_SKYBOX_LISTING: 'false' }, TEST_ADAPTERS);
     assert.equal(snapshot.monitoringOnly, true);
     assert.equal(snapshot.activeVenueCount, 1);
     assert.equal(snapshot.venues.length, 1);
@@ -172,22 +241,16 @@ const run = async () => {
     assert.equal(snapshot.venues.some(entry => entry.businessWindowOpen === true), true);
   });
 
-  test('each active venue has a defined adapter contract for the current milestone', () => {
-    for (const venueId of ACTIVE_VENUE_SET) {
-      const adapter = resolveVenueAdapter(venueId);
-      assert.ok(adapter, `missing adapter contract for ${venueId}`);
-      assert.equal(adapter.listingApprovalAllowed, false);
-      assert.equal(adapter.monitoringOnly, true);
-      assert.ok(Array.isArray(adapter.requiredInventoryFields));
-      assert.ok(adapter.requiredInventoryFields.includes('eventId'));
-      assert.ok(Array.isArray(adapter.smokeChecks));
-    }
-  });
-
-  test('resolveVenuePolicy correctly identifies inactive venues', () => {
-    const blocked = resolveVenuePolicy('grand_ole_opry');
-    assert.equal(blocked.active, false);
-    assert.equal(blocked.enabled, false);
+  test('runtime configuration resolves credentials from Worker secrets without exposing their names', async () => {
+    const fakeDb = { prepare: () => ({ all: async () => ({ results: [{
+      venue_id: 'example', venue_name: 'Example', timezone_name: 'UTC', security_tier: 'low',
+      config_json: JSON.stringify({ discoveryStrategy: 'singleStep', inventoryStrategy: 'singleStep', urlPattern: 'https://example.test' }),
+      credential_refs_json: JSON.stringify({ apiKey: 'EXAMPLE_API_KEY' })
+    }] }) }) };
+    const adapters = await getActiveVenueAdapters(fakeDb, { EXAMPLE_API_KEY: 'not-disclosed' });
+    assert.equal(adapters.length, 1);
+    assert.equal(adapters[0].apiKey, 'not-disclosed');
+    assert.equal('credential_refs_json' in adapters[0], false);
   });
 
   test('a valid monitoring signal generates a human-review notification payload', () => {
@@ -284,16 +347,16 @@ const run = async () => {
       },
     };
 
-    await getNextUpcomingEvent(fakeDb, ACTIVE_VENUE_SET);
-    await getNextEventWithActiveListing(fakeDb, ACTIVE_VENUE_SET);
-    await getListingForValidation(fakeDb, 'listing-123', ACTIVE_VENUE_SET);
+    await getNextUpcomingEvent(fakeDb, ['segerstrom_center']);
+    await getNextEventWithActiveListing(fakeDb, ['segerstrom_center']);
+    await getListingForValidation(fakeDb, 'listing-123', ['segerstrom_center']);
 
     for (const bind of capturedBinds) {
       assert.equal(bind.includes('grand_ole_opry'), false);
       assert.equal(bind.includes('broadway_com'), false);
       assert.equal(bind.includes('broadwaydirect_com'), false);
     }
-    assert.deepEqual(capturedBinds[0], ACTIVE_VENUE_SET);
+    assert.deepEqual(capturedBinds[0], ['segerstrom_center']);
   });
 
   test('scan queries return null instead of querying when no active venues are supplied', async () => {
@@ -314,7 +377,7 @@ const run = async () => {
       },
     };
 
-    await getNextEventWithActiveListing(fakeDb, ACTIVE_VENUE_SET);
+    await getNextEventWithActiveListing(fakeDb, ['segerstrom_center']);
 
     assert.ok(capturedSql.includes('l.price_cents'));
     assert.ok(capturedSql.includes('l.section_label'));
@@ -356,6 +419,7 @@ const run = async () => {
 
     assert.equal(result.length, 1);
     const seat = result[0];
+    assert.equal(seat.eventId, '30589');
     assert.equal(seat.section, 'Orchestra');
     assert.equal(seat.row, 'M');
     assert.equal(seat.seat, '3');
@@ -370,7 +434,7 @@ const run = async () => {
     const statements = [];
     const fakeDb = {
       prepare(sql) {
-        return { bind: (...values) => ({ sql, values }) };
+        return { bind: (...values) => ({ sql, values, all: async () => ({ results: [] }) }) };
       },
       batch: async batch => {
         statements.push(...batch);
@@ -386,6 +450,94 @@ const run = async () => {
     assert.equal(statements[1].values[1], 'segerstrom_center:Example%20Show');
   });
 
+  test('existing event IDs refresh changed showtime, hall, and event URL instead of silently skipping', async () => {
+    const runs = [];
+    const fakeDb = {
+      prepare(sql) {
+        if (sql.includes('FROM events WHERE id IN')) {
+          return {
+            bind: (...values) => ({
+              all: async () => ({ results: [{ id: 'event-1', showtime: '2026-12-01T20:00:00Z', event_url: 'https://example.test/old-event-1', venue_hall: 'Main Hall' }] }),
+              values,
+            })
+          };
+        }
+        return {
+          bind: (...values) => {
+            const statement = { sql, values };
+            return {
+              statement,
+              async run() {
+                runs.push(statement);
+                return { changes: 1 };
+              }
+            };
+          }
+        };
+      },
+      batch: async batch => {
+        runs.push(...batch.map(st => st.statement || st));
+        return batch.map(() => ({ changes: 1 }));
+      }
+    };
+
+    const result = await upsertDiscoveredEvents(fakeDb, [{
+      showName: 'Example Show', venueId: 'segerstrom_center', eventId: 'event-1',
+      showtime: '2026-12-02T20:00:00Z', eventDetailUrl: 'https://example.test/new-event-1', venueHall: 'Concert Hall'
+    }]);
+
+    assert.equal(result.inserted, 0);
+    assert.equal(result.updated, 1);
+    assert.ok(runs.some(entry => String(entry.sql || '').includes('UPDATE events SET')));
+  });
+
+  test('discovery registers a venue-scoped hall before linking a new event to it', async () => {
+    const statements = [];
+    const fakeDb = {
+      prepare: sql => ({ bind: (...values) => ({
+        sql,
+        values,
+        all: async () => ({ results: [] })
+      }) }),
+      batch: async batch => {
+        statements.push(...batch);
+        return batch.map(() => ({ changes: 1 }));
+      }
+    };
+    await upsertDiscoveredEvents(fakeDb, [{
+      showName: 'Example Show', venueId: 'segerstrom_center', eventId: 'hall-event',
+      showtime: '2026-12-01T20:00:00Z', venueHall: 'Samueli Theater'
+    }]);
+    assert.ok(statements.some(statement => statement.sql.includes('INSERT OR IGNORE INTO venue_halls')));
+    const eventInsert = statements.find(statement => statement.sql.includes('INSERT OR IGNORE INTO events'));
+    assert.equal(eventInsert.values.at(-1), 'segerstrom_center:hall:samueli%20theater');
+  });
+
+  test('discovery upsert chunks large event existence lookups below D1 bind limits', async () => {
+    const lookupBindCounts = [];
+    const fakeDb = {
+      prepare(sql) {
+        if (sql.includes('FROM events WHERE id IN')) {
+          return { bind: (...values) => ({
+            all: async () => {
+              lookupBindCounts.push(values.length);
+              return { results: [] };
+            }
+          }) };
+        }
+        return { bind: (...values) => ({ sql, values }) };
+      },
+      batch: async statements => statements.map(() => ({ changes: 1 }))
+    };
+    const events = Array.from({ length: 151 }, (_, index) => ({
+      showName: 'Example Show', venueId: 'segerstrom_center', eventId: `event-${index}`,
+      showtime: '2026-12-01T20:00:00Z', eventDetailUrl: `https://example.test/event-${index}`
+    }));
+    const result = await upsertDiscoveredEvents(fakeDb, events);
+    assert.equal(result.inserted, 151);
+    assert.deepEqual(lookupBindCounts, [75, 75, 1]);
+  });
+
   test('production discovery routes the SeatMe settings API through the API provider', async () => {
     let state = null;
     const fakeDb = {
@@ -397,6 +549,7 @@ const run = async () => {
               if (sql.includes('INSERT OR REPLACE INTO system_state')) state = JSON.parse(values[1]);
               return { changes: 1 };
             },
+            all: async () => ({ results: [] }),
             sql,
             values
           })
@@ -406,7 +559,7 @@ const run = async () => {
     };
     const settingsRequests = [];
     const adapter = {
-      venueName: 'Segerstrom Center for the Arts', algoliaAppId: 'app', algoliaApiKey: 'key', algoliaIndexName: 'index',
+      venueName: 'Segerstrom Center for the Arts', timezoneName: 'America/Los_Angeles', algoliaAppId: 'app', algoliaApiKey: 'key', algoliaIndexName: 'index',
       buyButtonApiUrl: 'https://www.scfta.org/BuyButton/ButtonById',
       settingsApiUrlPattern: 'https://seatme.scfta.org/api/settings/performance/{performanceId}',
       ticketingUrlTemplate: 'https://seatme.scfta.org/single?id={performanceId}'
@@ -417,7 +570,18 @@ const run = async () => {
       return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show' }] }) };
     };
     const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show' }], nbPages: 1 }) });
-    await segerstromProductionDiscoveryStrategy({ venue_id: 'segerstrom_center' }, '', { DB: fakeDb }, {}, secureFetch, () => {}, adapter, apiFetch);
+    const RealDate = globalThis.Date;
+    globalThis.Date = class extends RealDate {
+      constructor(value) {
+        super(value === undefined ? '2026-08-03T13:00:00-07:00' : value);
+      }
+      static now() { return new RealDate('2026-08-03T13:00:00-07:00').getTime(); }
+    };
+    try {
+      await segerstromProductionDiscoveryStrategy({ venue_id: 'segerstrom_center' }, '', { DB: fakeDb }, {}, secureFetch, () => {}, adapter, apiFetch);
+    } finally {
+      globalThis.Date = RealDate;
+    }
     assert.equal(settingsRequests.length, 1);
     assert.equal(settingsRequests[0].options.apiRequest, true);
   });
@@ -426,10 +590,34 @@ const run = async () => {
     const denied = await worker.fetch(new Request('https://example.com/targets'), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
     assert.equal(denied.status, 401);
 
-    const allowed = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    const fakeDb = { prepare: () => ({ all: async () => ({ results: [{
+      venue_id: 'example', venue_name: 'Example', timezone_name: 'UTC', security_tier: 'low',
+      config_json: JSON.stringify({ discoveryStrategy: 'singleStep', inventoryStrategy: 'singleStep', urlPattern: 'https://example.test' }),
+      credential_refs_json: JSON.stringify({ apiKey: 'EXAMPLE_API_KEY' })
+    }] }) }) };
+    const allowed = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET, EXAMPLE_API_KEY: 'not-disclosed', DB: fakeDb }, {});
     const payload = await allowed.json();
     assert.equal(allowed.status, 200);
     assert.equal('algoliaApiKey' in payload.venue_adapters[0], false);
+  });
+
+  test('exact inventory test endpoint requires authentication, an event ID, and a valid quantity', async () => {
+    const denied = await worker.fetch(new Request('https://example.com/inventory/test', { method: 'POST', body: '{}' }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(denied.status, 401);
+
+    const missingEventId = await worker.fetch(new Request('https://example.com/inventory/test', {
+      method: 'POST',
+      headers: { 'X-Webhook-Secret': WEBHOOK_SECRET, 'Content-Type': 'application/json' },
+      body: '{}'
+    }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(missingEventId.status, 400);
+
+    const invalidQuantity = await worker.fetch(new Request('https://example.com/inventory/test', {
+      method: 'POST',
+      headers: { 'X-Webhook-Secret': WEBHOOK_SECRET, 'Content-Type': 'application/json' },
+      body: '{"event_id":"30584","quantity":0}'
+    }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(invalidQuantity.status, 400);
   });
 
   test('automated approval requires two explicit production controls', () => {

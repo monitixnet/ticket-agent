@@ -71,3 +71,4 @@ python_modules/
 .venv-workers/
 .DS_Store
 
+eng.traineddata

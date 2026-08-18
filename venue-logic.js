@@ -1,10 +1,7 @@
-import {
-  ACTIVE_VENUE_SET,
-  ACTIVE_VENUE_ADAPTERS,
-  ACTIVE_VENUE_SMOKE_MATRIX,
-  VENUE_POLICY_MAP,
-  DEFAULT_BUSINESS_HOURS
-} from './venue-config.js';
+const DEFAULT_BUSINESS_HOURS = {
+  start: { hour: 7, minute: 30 },
+  end: { hour: 23, minute: 59 }
+};
 import {
   CRON_SCHEDULE_CONFIG
 } from './global-config.js';
@@ -17,59 +14,42 @@ export function isSkyboxListingEnabled(env) {
     && isEnabled(env?.ENABLE_AUTOMATED_APPROVAL);
 }
 
-function findInMap(map, venueIdentifier) {
-  const input = String(venueIdentifier ?? "").trim();
-  if (!input) return null;
-
-  const byId = map[input.toLowerCase()];
-  if (byId) return byId;
-
-  const normalized = input.toLowerCase()?.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-  return Object.values(map).find(item => item.venueId === normalized || item.venueName.toLowerCase()?.replace(/[^a-z0-9]+/g, "_") === normalized) || null;
+export function buildVenueAdapterSmokeReport(adapters = []) {
+  return adapters.map(adapter => ({
+    venueId: adapter.venueId,
+    venueName: adapter.venueName,
+    timezoneName: adapter.timezoneName,
+    sourceAdapter: 'venue_specific',
+    listingApprovalAllowed: false,
+    outboundApprovalEnabled: false,
+    monitoringOnly: true,
+    active: true,
+    mustPass: adapter.smokeChecks || []
+  }));
 }
 
-export function resolveVenuePolicy(venueIdentifier) {
-  return findInMap(VENUE_POLICY_MAP, venueIdentifier) || { active: false, enabled: false, reason: "Venue not in active or approved registry.", baseIntervalMs: 0, maxIntervalMs: 0 };
+export function isSmokeMatrixReady(adapters = []) {
+  return adapters.every(adapter => adapter.active && !adapter.listingApprovalAllowed);
 }
 
-export function buildVenueAdapterSmokeReport() {
-  return ACTIVE_VENUE_SMOKE_MATRIX.map(entry => {
-    const adapter = resolveVenueAdapter(entry.venueId);
-    return {
-      ...entry,
-      mustPass: adapter ? adapter.smokeChecks : []
-    };
-  });
-}
-
-export function isSmokeMatrixReady() {
-  return ACTIVE_VENUE_SMOKE_MATRIX.length === ACTIVE_VENUE_SET.length
-    && ACTIVE_VENUE_SMOKE_MATRIX.every(entry => entry.active && !entry.listingApprovalAllowed);
-}
-
-export function resolveVenueAdapter(venueIdentifier) {
-  return findInMap(ACTIVE_VENUE_ADAPTERS, venueIdentifier) || null;
-}
-
-export function buildOperationalTelemetrySnapshot(referenceDate = new Date(), env = {}) {
+export function buildOperationalTelemetrySnapshot(referenceDate = new Date(), env = {}, adapters = []) {
   const listingEnabled = isSkyboxListingEnabled(env);
   const monitoringOnly = !listingEnabled;
-  const venues = ACTIVE_VENUE_SET.map(venueId => {
-    const policy = resolveVenuePolicy(venueId);
-    const timeZone = policy.timezoneName || "UTC";
+  const venues = adapters.map(adapter => {
+    const timeZone = adapter.timezoneName || "UTC";
     const businessWindowOpen = isMonitoringWindowActive(referenceDate, timeZone);
     const reasonCode = businessWindowOpen ? "within_business_window" : "outside_business_window";
 
     return {
-      venueId,
-      venueName: policy.venueName,
+      venueId: adapter.venueId,
+      venueName: adapter.venueName,
       timezoneName: timeZone,
       businessWindowOpen,
       monitoringOnly,
       retryCount: 0,
       reasonCode,
       lastScanAt: null,
-      sourcePolicy: policy.sourcePolicy,
+      sourcePolicy: 'venue_specific',
       outboundApprovalEnabled: listingEnabled
     };
   });
@@ -85,14 +65,10 @@ export function buildOperationalTelemetrySnapshot(referenceDate = new Date(), en
 
 export function inferVenueTimeZone(venueName, _stateCode, explicitTimezone) {
   if (explicitTimezone) return explicitTimezone;
-
-  const policy = resolveVenuePolicy(venueName);
-  if (policy && policy.timezoneName) return policy.timezoneName;
-
   return "UTC";
 }
 
-export function isMonitoringWindowActive(date = new Date(), timeZone = "UTC") {
+export function isMonitoringWindowActive(date = new Date(), timeZone = "UTC", businessHours = DEFAULT_BUSINESS_HOURS) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
     hour: "2-digit",
@@ -104,14 +80,17 @@ export function isMonitoringWindowActive(date = new Date(), timeZone = "UTC") {
   const hourPart = parts.find(part => part.type === "hour")?.value ?? "0";
   const minutePart = parts.find(part => part.type === "minute")?.value ?? "0";
   const localMinutes = Number(hourPart) * 60 + Number(minutePart);
-  const startMinutes = DEFAULT_BUSINESS_HOURS.start.hour * 60 + DEFAULT_BUSINESS_HOURS.start.minute;
-  const endMinutes = DEFAULT_BUSINESS_HOURS.end.hour * 60 + DEFAULT_BUSINESS_HOURS.end.minute;
+  const start = businessHours?.start || DEFAULT_BUSINESS_HOURS.start;
+  const end = businessHours?.end || DEFAULT_BUSINESS_HOURS.end;
+  const startMinutes = Number(start.hour) * 60 + Number(start.minute);
+  const endMinutes = Number(end.hour) * 60 + Number(end.minute);
   return localMinutes >= startMinutes && localMinutes <= endMinutes;
 }
 
 export function getScheduleModeForCronDate(date = new Date()) {
   const minute = Number(date.getUTCMinutes());
-  if (CRON_SCHEDULE_CONFIG.primaryScanMinutes.has(minute)) return "primary_scan";
+  if (CRON_SCHEDULE_CONFIG.dropWatchMinutes.has(minute)) return "drop_watch";
+  if (CRON_SCHEDULE_CONFIG.inventoryScanMinutes.has(minute)) return "inventory_scan";
   if (CRON_SCHEDULE_CONFIG.listingWatchMinutes.has(minute)) return "listing_watch";
   if (CRON_SCHEDULE_CONFIG.discoveryScanMinutes.has(minute)) return "discovery_scan";
   return "idle";
