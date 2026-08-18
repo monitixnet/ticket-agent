@@ -17,6 +17,44 @@ async function nativeFetchProvider(_env, targetUrlString, _targetRow, fetchOptio
   return { text: await res.text(), status: res.status, routedVia: 'nativeFetchProvider' };
 }
 
+// ScrapFly preserves the upstream method, body, and request headers. That is
+// essential for Tessitura's form-encoded BuyButton POST endpoint; a browser
+// proxy that turns it into a navigation would return the wrong response.
+async function scrapeflyProvider(env, targetUrlString, _targetRow, fetchOptions = {}) {
+  const apiKey = env.SCRAPEFLY_API_KEY;
+  if (!apiKey) throw new Error('Missing SCRAPEFLY_API_KEY for scrapeflyProvider.');
+  const params = new URLSearchParams({
+    key: apiKey,
+    url: targetUrlString,
+    asp: 'true',
+    country: 'us',
+    format: 'raw',
+    retry: 'true',
+    timeout: '25000'
+  });
+  for (const [headerName, headerValue] of Object.entries(fetchOptions.headers || {})) {
+    params.append(`headers[${headerName}]`, String(headerValue));
+  }
+  console.log(`[SCRAPEFLY] Routing ${fetchOptions.method || 'GET'} via ScrapFly -> ${redactSensitiveLogValue(targetUrlString)}`);
+  const response = await fetch(`https://api.scrapfly.io/scrape?${params.toString()}`, {
+    method: fetchOptions.method || 'GET',
+    body: fetchOptions.body
+  });
+  const responseText = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    return { text: responseText, status: response.status, routedVia: 'scrapeflyProvider' };
+  }
+  const result = payload?.result || {};
+  return {
+    text: typeof result.content === 'string' ? result.content : responseText,
+    status: Number(result.status_code) || response.status,
+    routedVia: 'scrapeflyProvider'
+  };
+}
+
 async function executeCdpSession(providerName, provisioningDetails, targetUrlString) {
     console.log(`[${providerName.toUpperCase()} BROWSER] Routing via remote browser -> ${redactSensitiveLogValue(targetUrlString)}`);
 
@@ -257,6 +295,7 @@ async function zenrowsBrowserProvider(env, targetUrlString) {
 
 export const FETCH_PROVIDERS = {
   native: nativeFetchProvider,
+  scrapefly: scrapeflyProvider,
   zenrows_browser: zenrowsBrowserProvider,
   zenrows_api: zenrowsApiProxyProvider,
 };

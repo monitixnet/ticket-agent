@@ -20,6 +20,7 @@ DISCOVERY_MAX_PAGES="100"
 DISCOVERY_BATCH_SIZE="30"
 DISCOVERY_SUMMARY_NOTIFICATIONS="false"
 ALGOLIA_SEGERSTROM_API_KEY="your_segerstrom_algolia_search_key"
+SCRAPEFLY_API_KEY="your_scrapefly_api_key"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 CRITICAL_NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 WEBHOOK_SHARED_SECRET="your_shared_secret_here"
@@ -118,7 +119,7 @@ All-events inventory uses the same event scan path as `/inventory/single-event`.
 
 High-priority drop watches are separate from resale candidate rules. Every successful inventory scan records a performance state. A scan with zero available seats records `sold_out`; that performance is then automatically promoted into the priority drop lane. A later successful scan with any available seat creates one durable D1 alert and immediately delivers it through `CRITICAL_NOTIFICATION_OUTBOUND_URL`. Failed deliveries stay in `inventory_drop_alerts` and retry with bounded backoff. The alert is re-armed only after that performance becomes sold out again.
 
-Migration `0017_inventory_drop_watch.sql` seeds `Phantom of the Opera` at Segerstrom with a five-minute desired interval, so it receives priority immediately instead of waiting for its first broad scan. Drop watch has its own every-five-minute schedule (`*/5`) and does not run an all-events batch. Segerstrom's `dropWatchBatchSize` is `12`, enough to cover all currently discovered Phantom performances in one bounded pass. Other successfully observed sold-out performances are automatically prioritized at `automaticSoldOutIntervalMinutes` (5). General inventory runs separately at `9,29,59`. To add another exact show, insert an enabled `inventory_watch_rules` row with its venue ID, exact saved show name, and desired interval; do not put notification URLs or secrets in D1.
+Migration `0017_inventory_drop_watch.sql` seeds `Phantom of the Opera` at Segerstrom with a five-minute desired interval, so it receives priority immediately instead of waiting for its first broad scan. Drop watch has its own every-five-minute schedule (`*/5`) and does not run an all-events batch. Segerstrom's `dropWatchBatchSize` is `12`, enough to cover all currently discovered Phantom performances in one bounded pass. Other successfully observed sold-out performances are automatically prioritized at `automaticSoldOutIntervalMinutes` (5). General inventory runs separately at `9,29,59`; discovery runs every five minutes offset at `3-58/5`, completing the current 143-production catalog in about 75 minutes at ten productions per checkpoint. To add another exact show, insert an enabled `inventory_watch_rules` row with its venue ID, exact saved show name, and desired interval; do not put notification URLs or secrets in D1.
 
 Add `"include_seat_samples":true` to return real contiguous seat blocks for manual review.
 

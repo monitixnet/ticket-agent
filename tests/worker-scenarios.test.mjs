@@ -178,8 +178,8 @@ const run = async () => {
     assert.equal(getScheduleModeForCronDate(date), 'listing_watch');
   });
 
-  test('discovery scan is selected at minute 7', () => {
-    const date = new Date(Date.UTC(2026, 7, 3, 0, 7, 0));
+  test('discovery scan is selected at minute 3', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 3, 0));
     assert.equal(getScheduleModeForCronDate(date), 'discovery_scan');
   });
 

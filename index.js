@@ -831,6 +831,9 @@ async function runScheduledCycle(env, ctx, options = {}) {
         now,
         jitterMin: SCAN_JITTER_CONFIG.listingWatch.minMs,
         jitterMax: SCAN_JITTER_CONFIG.listingWatch.maxMs,
+        // Cron cadence already spaces Worker work. Do not burn the bounded
+        // invocation lifetime on a randomized sleep.
+        skipJitter: true,
         runParser: true,
         logPrefix: '[LISTING WATCHER]'
       });
@@ -876,6 +879,8 @@ async function runScheduledCycle(env, ctx, options = {}) {
             now,
             jitterMin: SCAN_JITTER_CONFIG.inventoryScan.minMs,
             jitterMax: SCAN_JITTER_CONFIG.inventoryScan.maxMs,
+            // Discovery is checkpointed; start its bounded batch immediately.
+            skipJitter: true,
             runParser: true,
             logPrefix: '[DISCOVERY SCAN]',
             adapter
@@ -1321,12 +1326,19 @@ Outcome: Transaction blocked automatically before a ghost sale collision could o
     //   curl "http://localhost:8787/cdn-cgi/local/scheduled?cron=test-listing-watch"
     // Real Cloudflare cron always sends one of the actual configured cron strings, never these
     // sentinels, so this override is inert in production.
+    const productionCronModes = {
+      '*/5 * * * *': 'drop_watch',
+      '9,29,59 * * * *': 'inventory_scan',
+      '17,27,57 * * * *': 'listing_watch',
+      '3-58/5 * * * *': 'discovery_scan'
+    };
     const forcedMode =
-      event?.cron === 'test-drop-watch' ? 'drop_watch' :
+      productionCronModes[event?.cron] ||
+      (event?.cron === 'test-drop-watch' ? 'drop_watch' :
       (event?.cron === 'test-inventory-scan' || event?.cron === 'test-primary-scan') ? 'inventory_scan' :
       event?.cron === 'test-listing-watch' ? 'listing_watch' :
       event?.cron === 'test-discovery-scan' ? 'discovery_scan' :
-      undefined;
+      undefined);
     const cycle = runScheduledCycle(env, ctx, forcedMode ? { forcedMode } : {});
     // Scheduled events must acknowledge promptly. The work continues under
     // waitUntil rather than holding the local cron HTTP trigger open.

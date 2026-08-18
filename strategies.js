@@ -1,5 +1,5 @@
 import { VENUE_PARSERS } from './venue-rules.js';
-import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, recordDiscoveryBatchMetric } from './database/queries.js';
+import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 import { isMonitoringWindowActive } from './venue-logic.js';
 
@@ -260,7 +260,7 @@ export async function calendarPageDiscoveryStrategy(targetRow, htmlBody, env, ct
  * A targeted, API-based discovery strategy for Segerstrom that uses a Production Season ID.
  * This is the most robust method, bypassing HTML scraping and dead APIs entirely.
  */
-export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
+async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
   console.log(`[PARSER] Segerstrom API-driven discovery strategy initiated for venue ${targetRow.venue_id}.`);
 
   const JOB_KEY = `segerstrom_discovery_job`;
@@ -604,6 +604,33 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, _htmlBody
     await clearDiscoveryJobState(env.DB, JOB_KEY);
   }
   return [];
+}
+
+export async function segerstromProductionDiscoveryStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
+  const jobKey = 'segerstrom_discovery_job';
+  const leaseOwner = crypto.randomUUID();
+  const now = new Date();
+  // Discovery runs every five minutes. The lease is deliberately slightly
+  // shorter so a terminated invocation recovers on the next cron, while a
+  // healthy bounded batch cannot be processed concurrently.
+  const leaseExpiresAt = new Date(now.getTime() + (4 * 60 * 1000)).toISOString();
+  const claimed = await claimDiscoveryJobLease(env.DB, jobKey, leaseOwner, leaseExpiresAt, now.toISOString());
+  if (!claimed) {
+    console.log(`[PARSER] Discovery job ${jobKey} is already leased; skipping overlapping invocation.`);
+    return [];
+  }
+
+  try {
+    return await segerstromProductionDiscoveryStrategyImpl(
+      targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch
+    );
+  } finally {
+    try {
+      await releaseDiscoveryJobLease(env.DB, jobKey, leaseOwner);
+    } catch (error) {
+      console.error(`[PARSER] Failed to release discovery lease: ${error.message}`);
+    }
+  }
 }
 
 /**

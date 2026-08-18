@@ -3,12 +3,21 @@
 	"name": "ticket-agent",
 	"main": "index.js",
 	"compatibility_date": "2026-07-30",
+	"vars": {
+		"ALLOW_SKYBOX_LISTING": "false",
+		"API_FETCH_PROVIDER_POOL": "scrapefly,native",
+		"DISCOVERY_MAX_PAGES": "30",
+		"ENABLE_AUTOMATED_APPROVAL": "false",
+		"ENABLE_DEBUG_NOTIFICATIONS": "true",
+		"FETCH_PROVIDER_POOL": "scrapefly,native",
+		"SKYBOX_API_GATEWAY_URL": "https://skybox.com"
+	},
 	"triggers": {
 		"crons": [
 			"*/5 * * * *",
 			"9,29,59 * * * *",
 			"17,27,57 * * * *",
-			"7,37 * * * *"
+			"3-58/5 * * * *"
 		]
 	},
 	"observability": {

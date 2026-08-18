@@ -365,6 +365,28 @@ export async function clearDiscoveryJobState(db, jobKey) {
     .run();
 }
 
+// Discovery checkpoints are stored as JSON in system_state. Use a separate,
+// compare-and-set lease key so an overlapping cron cannot read the same queue
+// and process the same production batch twice. A cancelled Worker naturally
+// becomes recoverable after the short expiry.
+export async function claimDiscoveryJobLease(db, jobKey, leaseOwner, leaseExpiresAt, nowIso) {
+  const leaseKey = `${jobKey}:lease`;
+  const payload = JSON.stringify({ leaseOwner, leaseExpiresAt });
+  const result = await db.prepare(`INSERT INTO system_state (key_name, value_string) VALUES (?, ?)
+    ON CONFLICT(key_name) DO UPDATE SET value_string = excluded.value_string
+    WHERE json_extract(system_state.value_string, '$.leaseExpiresAt') IS NULL
+      OR json_extract(system_state.value_string, '$.leaseExpiresAt') < ?
+      OR json_extract(system_state.value_string, '$.leaseOwner') = ?`)
+    .bind(leaseKey, payload, nowIso, leaseOwner).run();
+  return (result?.meta?.changes ?? result?.changes ?? 0) === 1;
+}
+
+export function releaseDiscoveryJobLease(db, jobKey, leaseOwner) {
+  return db.prepare(`DELETE FROM system_state
+    WHERE key_name = ? AND json_extract(value_string, '$.leaseOwner') = ?`)
+    .bind(`${jobKey}:lease`, leaseOwner).run();
+}
+
 export async function cleanupPastEvents(db) {
   console.log('[DB] Running cleanup job for past events...');
   // Purge events that happened more than 6 hours ago. The 6-hour buffer accounts

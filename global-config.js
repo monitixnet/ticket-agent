@@ -3,7 +3,7 @@ export const CRON_SCHEDULE_CONFIG = {
   dropWatchMinutes: new Set([0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]),
   inventoryScanMinutes: new Set([9, 29, 59]),
   listingWatchMinutes: new Set([17, 27, 57]),
-  discoveryScanMinutes: new Set([7, 37]),
+  discoveryScanMinutes: new Set([3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]),
 };
 
 export const SCAN_JITTER_CONFIG = {
