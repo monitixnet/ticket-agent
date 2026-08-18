@@ -242,11 +242,17 @@ const run = async () => {
   });
 
   test('runtime configuration resolves credentials from Worker secrets without exposing their names', async () => {
-    const fakeDb = { prepare: () => ({ all: async () => ({ results: [{
+    const configRow = {
       venue_id: 'example', venue_name: 'Example', timezone_name: 'UTC', security_tier: 'low',
       config_json: JSON.stringify({ discoveryStrategy: 'singleStep', inventoryStrategy: 'singleStep', urlPattern: 'https://example.test' }),
       credential_refs_json: JSON.stringify({ apiKey: 'EXAMPLE_API_KEY' })
-    }] }) }) };
+    };
+    const fakeDb = {
+      prepare: () => ({
+        bind: () => ({ first: async () => configRow }),
+        all: async () => ({ results: [configRow] })
+      })
+    };
     const adapters = await getActiveVenueAdapters(fakeDb, { EXAMPLE_API_KEY: 'not-disclosed' });
     assert.equal(adapters.length, 1);
     assert.equal(adapters[0].apiKey, 'not-disclosed');
@@ -590,12 +596,27 @@ const run = async () => {
     const denied = await worker.fetch(new Request('https://example.com/targets'), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
     assert.equal(denied.status, 401);
 
-    const fakeDb = { prepare: () => ({ all: async () => ({ results: [{
+    const configRow = {
       venue_id: 'example', venue_name: 'Example', timezone_name: 'UTC', security_tier: 'low',
       config_json: JSON.stringify({ discoveryStrategy: 'singleStep', inventoryStrategy: 'singleStep', urlPattern: 'https://example.test' }),
       credential_refs_json: JSON.stringify({ apiKey: 'EXAMPLE_API_KEY' })
-    }] }) }) };
-    const allowed = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET, EXAMPLE_API_KEY: 'not-disclosed', DB: fakeDb }, {});
+    };
+    const fakeDb = {
+      prepare: () => ({
+        bind: () => ({ first: async () => configRow }),
+        all: async () => ({ results: [configRow] })
+      })
+    };
+    const noVenueBinding = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET, EXAMPLE_API_KEY: 'not-disclosed', DB: fakeDb }, {});
+    assert.equal(noVenueBinding.status, 200);
+    assert.deepEqual((await noVenueBinding.json()).venue_adapters, []);
+
+    const allowed = await worker.fetch(new Request('https://example.com/targets', { headers: { 'X-Webhook-Secret': WEBHOOK_SECRET } }), {
+      WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET,
+      EXAMPLE_API_KEY: 'not-disclosed',
+      WORKER_VENUE_ID: 'example',
+      DB: fakeDb
+    }, {});
     const payload = await allowed.json();
     assert.equal(allowed.status, 200);
     assert.equal('algoliaApiKey' in payload.venue_adapters[0], false);

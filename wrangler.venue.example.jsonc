@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ticket-agent-venue-slug",
+  "main": "index.js",
+  "compatibility_date": "2026-07-30",
+  "vars": {
+    "ALLOW_SKYBOX_LISTING": "false",
+    "API_FETCH_PROVIDER_POOL": "native",
+    "DISCOVERY_MAX_PAGES": "30",
+    "ENABLE_AUTOMATED_APPROVAL": "false",
+    "ENABLE_DEBUG_NOTIFICATIONS": "false",
+    "FETCH_PROVIDER_POOL": "native",
+    "WORKER_VENUE_ID": "venue_slug"
+  },
+  "triggers": {
+    "crons": []
+  },
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ticket-agent-db",
+      "database_id": "REPLACE_WITH_THE_SHARED_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

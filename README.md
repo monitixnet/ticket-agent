@@ -10,13 +10,14 @@ Strategy names are intentionally allowlisted in code; D1 selects an approved str
 
 ## Local setup
 
-Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The worker uses a Cloudflare D1 database, which should be configured in your `wrangler.toml` file.
+Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The Worker uses a Cloudflare D1 database configured by its venue-specific Wrangler file.
 
 ```bash
 # Example .dev.vars
 FETCH_PROVIDER_POOL="native"
 API_FETCH_PROVIDER_POOL="native"
 DISCOVERY_MAX_PAGES="100"
+WORKER_VENUE_ID="segerstrom_center"
 DISCOVERY_BATCH_SIZE="30"
 DISCOVERY_SUMMARY_NOTIFICATIONS="false"
 ALGOLIA_SEGERSTROM_API_KEY="your_segerstrom_algolia_search_key"
@@ -56,7 +57,7 @@ The Cloudflare D1 binding name used by the worker is `DB`, matching the code in 
 Start one local Worker terminal first:
 
 ```bash
-npx wrangler dev
+npm run dev:segerstrom
 ```
 
 Then, from a second terminal, trigger the desired bounded job:
@@ -72,7 +73,7 @@ curl -i "http://localhost:8787/cdn-cgi/local/scheduled?cron=test-drop-watch"
 curl -i "http://localhost:8787/cdn-cgi/local/scheduled?cron=test-discovery-scan"
 ```
 
-Run only one `npx wrangler dev` process at a time; a second local Worker can lock Wrangler's SQLite development state.
+Run only one local Worker process at a time; a second Worker can lock Wrangler's SQLite development state.
 
 For deployed Cloudflare D1, apply migrations before deployment and seed once:
 
@@ -81,7 +82,7 @@ npx wrangler d1 migrations apply ticket-agent-db --remote
 npx wrangler d1 execute ticket-agent-db --remote --file=database/seed.sql
 ```
 
-Before enabling Segerstrom, set its credential as a Worker secret (not in `wrangler.jsonc` or D1):
+Before enabling Segerstrom, set its credential as a Worker secret (not in `wrangler.venue.segerstrom.jsonc` or D1):
 
 ```bash
 npx wrangler secret put ALGOLIA_SEGERSTROM_API_KEY
@@ -164,19 +165,32 @@ The following are explicit non-goals for this phase and must remain true:
 
 ## Deploying Ticket Agent
 
+### Segerstrom Worker
+
+`wrangler.venue.segerstrom.jsonc` is the deployment configuration for the Segerstrom Worker. It names that Worker `ticket-agent-segerstrom` and binds it to only `segerstrom_center` through `WORKER_VENUE_ID`.
+
 ```bash
-npx wrangler deploy
+npm run deploy:segerstrom
 ```
 
-After deployment returns a live confirmation URL, add the required secrets:
+### Additional venue Workers
+
+Each venue gets an independent Worker deployment from this same repository. Copy [wrangler.venue.example.jsonc](wrangler.venue.example.jsonc), set its Worker name and `WORKER_VENUE_ID`, then connect the new Cloudflare Worker to this repository with:
+
+```text
+Build command:  npm test
+Deploy command: npx wrangler deploy --config wrangler.<venue>.jsonc
+```
+
+The configuration must use the same D1 binding while every Worker has its own secret bindings, schedules, provider budget, and venue ID. Do not deploy a multi-venue Worker without a `WORKER_VENUE_ID`; the application fails closed and loads no venues.
+
+After creating a Worker, add its required secrets in that Worker's Cloudflare settings:
 
 ```bash
-npx wrangler secret put FETCH_PROVIDER_POOL
-npx wrangler secret put ZENROWS_API_URL
-npx wrangler secret put ZENROWS_API_TOKEN
+npx wrangler secret put ALGOLIA_SEGERSTROM_API_KEY
+npx wrangler secret put SCRAPEFLY_API_KEY
 npx wrangler secret put NOTIFICATION_OUTBOUND_URL
-npx wrangler secret put DISCOVERY_SUMMARY_NOTIFICATIONS
 npx wrangler secret put WEBHOOK_SHARED_SECRET
 ```
 
-These variables are required for the app to connect to your database, proxy gateway, and notification endpoint in both local and deployed environments. `DISCOVERY_SUMMARY_NOTIFICATIONS` is optional but recommended only when you want discovery-cycle summaries in Telegram; the worker will otherwise stay quiet unless a higher-priority alert is triggered. `WEBHOOK_SHARED_SECRET` must also be configured on whatever system calls `/webhook/validate` or `/logs/recent`, sent as the `X-Webhook-Secret` header.
+Secrets are Worker-specific and never belong in Git or `wrangler*.jsonc`. A venue only needs the secrets referenced by its active D1 runtime configuration. `WEBHOOK_SHARED_SECRET` must also be configured on whatever system calls `/webhook/validate` or `/logs/recent`, sent as the `X-Webhook-Secret` header.

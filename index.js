@@ -44,7 +44,7 @@ import {
 import { STRATEGY_REGISTRY } from './strategies.js';
 import { FETCH_PROVIDERS } from './fetch-providers.js';
 import { computeStringHash, delayExecution, randomBetween, computeJitteredDelay, buildWorkerLogId, timingSafeEqual } from './utils.js';
-import { getActiveVenueAdapters, getVenueAdapter, buildPublicVenueSummary } from './database/venue-runtime-config.js';
+import { getVenueAdapter, buildPublicVenueSummary } from './database/venue-runtime-config.js';
 
 export function buildHumanReviewNotification(payload = {}) {
   const coverage = payload.coverage || { targetQuantity: 1, equivalentInventoryCount: 0, requiredMinimum: 3, meetsRequirement: false };
@@ -82,6 +82,19 @@ export function filterInventoryForDropPriceRule(inventory = [], maxPriceCents = 
 
 function buildPublicAdapterSummaries(adapters = []) {
   return adapters.map(buildPublicVenueSummary);
+}
+
+// One deployment is one venue/tenant. This prevents a venue's cron or provider
+// budget from accidentally operating on every active D1 venue.
+async function getWorkerScopedAdapters(env) {
+  const venueId = String(env?.WORKER_VENUE_ID || '').trim();
+  if (!venueId) {
+    console.error('[CONFIG] WORKER_VENUE_ID is required; this Worker will not load any venue.');
+    return [];
+  }
+  const adapter = await getVenueAdapter(env.DB, env, venueId);
+  if (!adapter) console.error(`[CONFIG] WORKER_VENUE_ID=${venueId} is not an active, valid venue adapter.`);
+  return adapter ? [adapter] : [];
 }
 
 function summarizeEquivalentInventoryPools(venueId, eventId, inventory, quantity, includeSeatSamples = false) {
@@ -813,7 +826,7 @@ async function runScheduledCycle(env, ctx, options = {}) {
     console.log(`[MARKET ENGINE] USA Multi-Venue Priority Engine Cycle Woken Up [${scheduleMode}]`);
     console.log('====================================================');
 
-    const activeAdapters = await getActiveVenueAdapters(env.DB, env);
+    const activeAdapters = await getWorkerScopedAdapters(env);
     const activeVenueIds = activeAdapters.map(adapter => adapter.venueId);
 
     if (scheduleMode === 'listing_watch') {
@@ -934,7 +947,7 @@ export default {
       if (!isRequestAuthorized(request, env)) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
       }
-      const adapters = await getActiveVenueAdapters(env.DB, env);
+      const adapters = await getWorkerScopedAdapters(env);
       return new Response(JSON.stringify({
         generated_at: new Date().toISOString(),
         listing_enabled: isSkyboxListingEnabled(env),
@@ -987,7 +1000,7 @@ export default {
       if (!hasValidTarget || !Number.isInteger(targetQuantity) || targetQuantity <= 0 || targetQuantity > 10) {
         return new Response(JSON.stringify({ error: 'quantity must be an integer from 1 to 10; an optional target requires section, row, seat, and price_cents' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
-      const activeVenueIds = (await getActiveVenueAdapters(env.DB, env)).map(adapter => adapter.venueId);
+      const activeVenueIds = (await getWorkerScopedAdapters(env)).map(adapter => adapter.venueId);
       const targetRow = await getUpcomingEventById(env.DB, eventId, activeVenueIds);
       if (!targetRow) {
         return new Response(JSON.stringify({ error: 'Active upcoming event not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -1085,7 +1098,7 @@ export default {
     }
 
     if (url.pathname === '/') {
-      const adapters = await getActiveVenueAdapters(env.DB, env);
+      const adapters = await getWorkerScopedAdapters(env);
       return new Response(JSON.stringify({
         service: 'Ticket Agent',
         status: 'active',
@@ -1145,7 +1158,7 @@ export default {
       }
 
       const incomingListingId = orderPayload.skybox_listing_id;
-      const activeVenueIds = (await getActiveVenueAdapters(env.DB, env)).map(adapter => adapter.venueId);
+      const activeVenueIds = (await getWorkerScopedAdapters(env)).map(adapter => adapter.venueId);
       const targetRow = await getListingForValidation(env.DB, incomingListingId, activeVenueIds);
 
       if (!targetRow) {

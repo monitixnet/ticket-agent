@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "ticket-agent",
+	"name": "ticket-agent-segerstrom",
 	"main": "index.js",
 	"compatibility_date": "2026-07-30",
 	"vars": {
@@ -10,7 +10,8 @@
 		"ENABLE_AUTOMATED_APPROVAL": "false",
 		"ENABLE_DEBUG_NOTIFICATIONS": "true",
 		"FETCH_PROVIDER_POOL": "scrapefly,native",
-		"SKYBOX_API_GATEWAY_URL": "https://skybox.com"
+		"SKYBOX_API_GATEWAY_URL": "https://skybox.com",
+		"WORKER_VENUE_ID": "segerstrom_center"
 	},
 	"triggers": {
 		"crons": [
