@@ -634,6 +634,8 @@ const run = async () => {
       }
     };
     const settingsRequests = [];
+    const bulkBuyButtonRequests = [];
+    let singleBuyButtonRequestCount = 0;
     const adapter = {
       venueName: 'Segerstrom Center for the Arts', timezoneName: 'America/Los_Angeles', algoliaAppId: 'app', algoliaApiKey: 'key', algoliaIndexName: 'index',
       buyButtonApiUrl: 'https://www.scfta.org/BuyButton/ButtonById',
@@ -641,11 +643,31 @@ const run = async () => {
       ticketingUrlTemplate: 'https://seatme.scfta.org/single?id={performanceId}'
     };
     const secureFetch = async (_env, url, _target, options) => {
-      if (url.includes('ButtonById')) return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ SubItems: [{ ItemId: 123, Status: 'OnSale', TicketCount: 1 }] }) };
+      if (url.includes('ButtonsById')) {
+        bulkBuyButtonRequests.push({ url, options });
+        // Deliberately reverse the records: discovery must correlate each
+        // response by ItemId rather than assume response order.
+        return {
+          status: 200,
+          routedVia: 'native',
+          text: JSON.stringify([
+            { ItemId: 789, SubItems: [{ ItemId: 7891, Status: 'OnSale', TicketCount: 1 }] },
+            { ItemId: 456, SubItems: [{ ItemId: 4561, Status: 'OnSale', TicketCount: 1 }] }
+          ])
+        };
+      }
+      if (url.includes('ButtonById')) {
+        singleBuyButtonRequestCount += 1;
+        return { status: 200, routedVia: 'native', text: JSON.stringify({ SubItems: [] }) };
+      }
       settingsRequests.push({ url, options });
-      return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show', hallName: 'Segerstrom Hall' }] }) };
+      const performanceId = url.split('/').at(-1);
+      return { status: 200, routedVia: 'native', text: JSON.stringify({ additionalPerformances: [{ performanceId, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show', hallName: 'Segerstrom Hall' }] }) };
     };
-    const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show', Venue: ['Segerstrom Hall'] }], nbPages: 1 }) });
+    const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [
+      { TessituraId: 456, Title: 'Example Show One', Venue: ['Segerstrom Hall'] },
+      { TessituraId: 789, Title: 'Example Show Two', Venue: ['Segerstrom Hall'] }
+    ], nbPages: 1 }) });
     const RealDate = globalThis.Date;
     globalThis.Date = class extends RealDate {
       constructor(value) {
@@ -658,8 +680,12 @@ const run = async () => {
     } finally {
       globalThis.Date = RealDate;
     }
-    assert.equal(settingsRequests.length, 1);
-    assert.equal(settingsRequests[0].options.apiRequest, true);
+    assert.equal(bulkBuyButtonRequests.length, 1);
+    assert.match(bulkBuyButtonRequests[0].options.body, /ProdIds%5B%5D=456/);
+    assert.match(bulkBuyButtonRequests[0].options.body, /ProdIds%5B%5D=789/);
+    assert.equal(singleBuyButtonRequestCount, 0);
+    assert.equal(settingsRequests.length, 2);
+    assert.ok(settingsRequests.every(request => request.options.apiRequest === true));
     const eventInsert = persistedStatements.find(statement => statement.sql?.includes('INSERT OR IGNORE INTO events'));
     assert.equal(eventInsert.values[4], 'Segerstrom Hall');
   });

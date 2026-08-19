@@ -132,11 +132,16 @@ export function resolveCalendarVenueHall(calendarHit) {
   return firstNonEmptyString(venues);
 }
 
-function isDiscoveryHallAllowed(adapter, hallName) {
+function getDiscoveryAllowedHalls(adapter) {
   const configured = Array.isArray(adapter?.discoveryAllowedHalls)
     ? adapter.discoveryAllowedHalls
-    : ['Segerstrom Hall'];
-  const allowed = new Set(configured.map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
+    : [];
+  const normalized = configured.map(value => String(value || '').trim()).filter(Boolean);
+  return normalized.length > 0 ? normalized : ['Segerstrom Hall'];
+}
+
+function isDiscoveryHallAllowed(adapter, hallName) {
+  const allowed = new Set(getDiscoveryAllowedHalls(adapter).map(value => value.toLowerCase()));
   return allowed.has(String(hallName || '').trim().toLowerCase());
 }
 
@@ -402,7 +407,14 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     let totalPages = 1;
 
     while (page < totalPages && page < maxPages) {
-      const algoliaPayload = { params: `hitsPerPage=100&page=${page}&filters=ExcludeFromCalendar:false AND ItemType:Production` };
+      // SCFTA exposes Venue as an Algolia facet. Query every configured
+      // allowed hall directly, then retain the allowlist below as a second
+      // safeguard in case the upstream facet format changes.
+      const hallFilters = getDiscoveryAllowedHalls(adapter)
+        .map(hall => `Venue:"${hall.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`)
+        .join(' OR ');
+      const algoliaFilters = `ExcludeFromCalendar:false AND ItemType:Production AND (${hallFilters})`;
+      const algoliaPayload = { params: `hitsPerPage=100&page=${page}&filters=${encodeURIComponent(algoliaFilters)}` };
       const algoliaResponse = await executeApiFetch(algoliaUrl, {
         method: 'POST',
         body: JSON.stringify(algoliaPayload),
@@ -510,6 +522,71 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   const batchOutcomeCounts = emptyDiscoveryOutcomeCounts();
   const unknownOutcomeSamplesInRun = [];
   console.log(`[PARSER] Processing a batch of ${batchToProcess.length} productions.`);
+
+  // The public SCFTA calendar requests all production statuses through this
+  // plural endpoint. Its ProductionSeason response has the same SubItems
+  // shape as the legacy single-production endpoint, but uses one request for
+  // the whole discovery batch.
+  const buyButtonsApiUrl = String(adapter.buyButtonApiUrl || '')
+    .replace(/\/ButtonById(?:\?.*)?$/i, '/ButtonsById');
+  let bulkBuyButtonsByProductionId = null;
+  let bulkBuyButtonsResponse = null;
+
+  const loadBatchBuyButtons = async () => {
+    if (bulkBuyButtonsByProductionId !== null) return;
+    bulkBuyButtonsByProductionId = new Map();
+
+    if (!buyButtonsApiUrl || buyButtonsApiUrl === adapter.buyButtonApiUrl) {
+      console.warn('[PARSER] Bulk BuyButton endpoint is not configured; using the single-production fallback.');
+      return;
+    }
+
+    const body = new URLSearchParams({
+      ShouldUseOgMos: 'true',
+      KeepPromos: 'false'
+    });
+    for (const production of batchToProcess) body.append('ProdIds[]', production.id);
+
+    try {
+      console.log(`[PARSER] Checking ${batchToProcess.length} production(s) via bulk BuyButton API.`);
+      const response = await executeSecureFetch(env, buyButtonsApiUrl, targetRow, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
+        body: body.toString(),
+        requestBudget
+      });
+      bulkBuyButtonsResponse = response;
+      if (!response || response.status < 200 || response.status >= 300) {
+        throw new Error(`Bulk BuyButton API returned HTTP ${response?.status ?? 'unknown'}.`);
+      }
+      const buttons = JSON.parse(response.text || 'null');
+      if (!Array.isArray(buttons)) throw new Error('Bulk BuyButton API returned a non-array response.');
+
+      for (const button of buttons) {
+        const productionId = normalizeExternalId(button?.ItemId);
+        if (productionId) bulkBuyButtonsByProductionId.set(productionId, button);
+      }
+      logDiscoveryEndpointShape(env, 'buy_buttons_by_id', buttons, {
+        responseStatus: response.status,
+        requestedProductionCount: batchToProcess.length,
+        returnedProductionCount: bulkBuyButtonsByProductionId.size
+      });
+      console.log('[PARSER] Bulk BuyButton response', {
+        responseStatus: response.status,
+        requestedProductionCount: batchToProcess.length,
+        returnedProductionCount: bulkBuyButtonsByProductionId.size
+      });
+    } catch (error) {
+      // Preserve the known-good legacy behavior for a transient bulk failure.
+      // Individual requests are attempted only in this exceptional case or
+      // when SCFTA omits a requested ItemId from an otherwise valid batch.
+      console.warn('[PARSER] Bulk BuyButton request failed; using the single-production fallback for missing records.', {
+        error: error?.message || String(error),
+        requestedProductionCount: batchToProcess.length
+      });
+    }
+  };
+
   for (let batchIndex = 0; batchIndex < batchToProcess.length; batchIndex++) {
     if (!isMonitoringWindowActive(new Date(), adapter.timezoneName, adapter.businessHours)) {
       const deferredProductions = batchToProcess.slice(batchIndex);
@@ -526,37 +603,44 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     console.log(`\n[PARSER] Processing production ${currentItemNumber} of ${initialQueueSize}: "${productionTitle}" (ID: ${productionSeasonId})`);
 
     try {
-      const buttonApiBody = new URLSearchParams({
-        ItemId: productionSeasonId,
-        ItemType: 'ProductionSeason',
-        OnlyFirstAvail: 'false',
-        ShouldUseOgMos: 'false',
-        KeepPromos: 'false'
-      }).toString();
-      console.log(`[PARSER] Checking for on-sale status via BuyButton API for production ID: ${productionSeasonId}`);
-      const buttonResponse = await executeSecureFetch(env, adapter.buyButtonApiUrl, targetRow, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
-        body: buttonApiBody,
-        requestBudget
-      });
+      await loadBatchBuyButtons();
+      let buttonResponse = bulkBuyButtonsResponse;
+      buyButton = bulkBuyButtonsByProductionId.get(productionSeasonId) || null;
 
-      console.log(`[PARSER] BuyButton response`, {
-        productionId: productionSeasonId,
-        title: productionTitle,
-        responseStatus: buttonResponse?.status
-      });
-
-      if (!buttonResponse) {
-        throw new Error('BuyButton returned no response object.');
-      }
-
-      if (buttonResponse?.text && typeof buttonResponse.text === 'string') {
+      if (buyButton) {
+        console.log('[PARSER] BuyButton batch response', {
+          productionId: productionSeasonId,
+          title: productionTitle,
+          responseStatus: buttonResponse?.status
+        });
+      } else {
+        const buttonApiBody = new URLSearchParams({
+          ItemId: productionSeasonId,
+          ItemType: 'ProductionSeason',
+          OnlyFirstAvail: 'false',
+          ShouldUseOgMos: 'false',
+          KeepPromos: 'false'
+        }).toString();
+        console.warn(`[PARSER] Bulk BuyButton response omitted production ${productionSeasonId}; using the single-production fallback.`);
+        buttonResponse = await executeSecureFetch(env, adapter.buyButtonApiUrl, targetRow, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
+          body: buttonApiBody,
+          requestBudget
+        });
+        if (!buttonResponse) throw new Error('BuyButton returned no response object.');
+        console.log('[PARSER] BuyButton fallback response', {
+          productionId: productionSeasonId,
+          title: productionTitle,
+          responseStatus: buttonResponse.status
+        });
+        if (buttonResponse.text && typeof buttonResponse.text === 'string') {
         try {
           buyButton = JSON.parse(buttonResponse.text);
         } catch (e) {
           trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Failed to parse BuyButton API response.`, { productionId: productionSeasonId, error: e.message, responseText: buttonResponse.text.slice(0, 200) });
           // button remains {} and will be skipped gracefully
+        }
         }
       }
       logDiscoveryEndpointShape(env, 'buy_button', buyButton, { productionId: productionSeasonId, responseStatus: buttonResponse.status });
