@@ -260,17 +260,30 @@ export async function calendarPageDiscoveryStrategy(targetRow, htmlBody, env, ct
  * A targeted, API-based discovery strategy for Segerstrom that uses a Production Season ID.
  * This is the most robust method, bypassing HTML scraping and dead APIs entirely.
  */
-async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
+async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch, options = {}) {
   console.log(`[PARSER] Segerstrom API-driven discovery strategy initiated for venue ${targetRow.venue_id}.`);
 
   const JOB_KEY = `segerstrom_discovery_job`;
+  const singleProduction = options.singleProduction || null;
   let initialQueueSize = 0;
-  let jobState = await getDiscoveryJobState(env.DB, JOB_KEY);
+  let jobState = singleProduction ? null : await getDiscoveryJobState(env.DB, JOB_KEY);
 
   // Start only when there is no saved job. An existing job with an empty queue
   // must reach the completion branch below so it can log completion and clear
   // its checkpoint instead of silently restarting discovery.
-  if (!jobState) {
+  if (singleProduction) {
+    const productionId = normalizeExternalId(singleProduction.id);
+    if (!productionId) throw new Error('single production requires a valid production ID.');
+    jobState = {
+      productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`) }],
+      processedIds: [], totalEventsDiscovered: 0, totalProductions: 1,
+      processedProductions: 0, remainingProductions: 1, complete: false,
+      lastUpdatedAt: new Date().toISOString(), productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
+      unknownOutcomeSamples: [], runCount: 0,
+    };
+    initialQueueSize = 1;
+    console.log(`[SINGLE PRODUCTION DISCOVERY] Running production ${productionId} without reading or advancing ${JOB_KEY}.`);
+  } else if (!jobState) {
     console.log(`[PARSER] No active discovery job found. Starting a new one.`);
     const { algoliaAppId, algoliaApiKey, algoliaIndexName } = adapter;
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
@@ -332,7 +345,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
 
   // Process a polite, bounded chunk per scheduled invocation. This remains
   // sequential within the batch to avoid bursts against the venue.
-  const BATCH_SIZE = Math.max(1, Math.min(Number(adapter.discoveryBatchSize ?? env.DISCOVERY_BATCH_SIZE) || 30, 50));
+  const BATCH_SIZE = singleProduction ? 1 : Math.max(1, Math.min(Number(adapter.discoveryBatchSize ?? env.DISCOVERY_BATCH_SIZE) || 30, 50));
   const totalRemainingBeforeBatch = jobState.productionQueue.length + (jobState.processedIds?.length || 0);
   const batchToProcess = jobState.productionQueue.splice(0, BATCH_SIZE);
 
@@ -531,7 +544,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   jobState.runCount = jobRunNumber;
   jobState.complete = jobState.productionQueue.length === 0;
   jobState.lastUpdatedAt = new Date().toISOString();
-  await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
+  if (!singleProduction) await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
 
   const batchDurationMs = Date.now() - batchStartedAt;
   const batchCompletedAtIso = new Date().toISOString();
@@ -550,6 +563,20 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     jobRunNumber,
     estimatedRunsRemaining
   });
+
+  if (singleProduction) {
+    return {
+      status: 'completed',
+      productionId: processedThisRun[0] || normalizeExternalId(singleProduction.id),
+      title: singleProduction.title || null,
+      outcome: Object.entries(batchOutcomeCounts).find(([, count]) => count > 0)?.[0] || 'unknown',
+      discoveredEvents: allDiscoveredEvents,
+      insertedEvents: upsertResult.inserted || 0,
+      updatedEvents: upsertResult.updated || 0,
+      failedProductionCount,
+      durationMs: batchDurationMs,
+    };
+  }
 
   await recordDiscoveryBatchMetric(env.DB, {
     id: `discovery:${targetRow.venue_id}:${batchStartedAt}:${crypto.randomUUID()}`,
@@ -631,6 +658,15 @@ export async function segerstromProductionDiscoveryStrategy(targetRow, htmlBody,
       console.error(`[PARSER] Failed to release discovery lease: ${error.message}`);
     }
   }
+}
+
+// Uses the same production-processing path as queued discovery, but never
+// creates, leases, advances, or clears the paginated discovery checkpoint.
+export async function segerstromSingleProductionDiscovery(targetRow, production, env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch) {
+  return segerstromProductionDiscoveryStrategyImpl(
+    targetRow, '', env, ctx, executeSecureFetch, trackWorkerLog, adapter, executeApiFetch,
+    { singleProduction: production }
+  );
 }
 
 /**

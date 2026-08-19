@@ -41,7 +41,7 @@ import {
   isBlockLikeStatus,
   computeBackoffDelayMs
 } from './venue-logic.js';
-import { STRATEGY_REGISTRY } from './strategies.js';
+import { STRATEGY_REGISTRY, segerstromSingleProductionDiscovery } from './strategies.js';
 import { FETCH_PROVIDERS } from './fetch-providers.js';
 import { computeStringHash, delayExecution, randomBetween, computeJitteredDelay, buildWorkerLogId, timingSafeEqual } from './utils.js';
 import { getVenueAdapter, buildPublicVenueSummary } from './database/venue-runtime-config.js';
@@ -973,6 +973,62 @@ export default {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/discovery/single-production') {
+      if (!isRequestAuthorized(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      }
+      let payload;
+      try {
+        payload = await request.json();
+      } catch {
+        return new Response(JSON.stringify({ error: 'Invalid JSON format' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const productionId = String(payload?.production_id || '').trim();
+      const title = typeof payload?.title === 'string' ? payload.title.trim() : '';
+      if (!/^\d{1,20}$/.test(productionId)) {
+        return new Response(JSON.stringify({ error: 'production_id must be a numeric Tessitura production ID' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const [adapter] = await getWorkerScopedAdapters(env);
+      if (!adapter) {
+        return new Response(JSON.stringify({ error: 'No valid Worker venue binding is configured' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (adapter.discoveryStrategy !== 'segerstromProductionDiscovery') {
+        return new Response(JSON.stringify({ error: 'Single-production discovery is not implemented for this venue adapter' }), { status: 501, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (!isMonitoringWindowActive(new Date(), adapter.timezoneName, adapter.businessHours)) {
+        return new Response(JSON.stringify({ error: 'Outside the venue monitoring window' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      const targetRow = {
+        venue_id: adapter.venueId,
+        venue_name: adapter.venueName,
+        timezone_name: adapter.timezoneName,
+        security_tier: adapter.securityTier,
+        event_url: adapter.urlPattern,
+        show_name: title || `Production ${productionId}`,
+        event_id: `single-discovery:${productionId}`,
+      };
+      console.log(`[SINGLE PRODUCTION DISCOVERY] Running ${targetRow.show_name} (production ${productionId}).`);
+      const result = await segerstromSingleProductionDiscovery(
+        targetRow,
+        { id: productionId, title: title || targetRow.show_name },
+        env,
+        ctx,
+        executeSecureFetch,
+        trackWorkerLog,
+        adapter,
+        (apiUrl, options) => executeApiFetch(apiUrl, {
+          ...options,
+          debugLog: (message, level) => debugLogAndNotify(env, ctx, message, level)
+        })
+      );
+      return new Response(JSON.stringify({
+        mode: 'single_production_discovery',
+        venue_id: adapter.venueId,
+        ...result,
+      }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
     if (request.method === 'POST' && (url.pathname === '/inventory/single-event' || url.pathname === '/inventory/test')) {

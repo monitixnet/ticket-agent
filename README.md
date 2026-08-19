@@ -100,6 +100,7 @@ Each listing stores its listed price as `price_cents` (integer cents) on the `li
 - GET /monitoring/targets — full JSON registry of monitored venues and sources
 - GET /logs/recent — recent persisted worker logs (requires `X-Webhook-Secret`)
 - POST /inventory/single-event — authenticated, exact-event monitoring-only scan (requires `X-Webhook-Secret`); `/inventory/test` remains a compatibility alias
+- POST /discovery/single-production — authenticated, exact Tessitura production discovery that does not advance the scheduled discovery job (requires `X-Webhook-Secret`)
 - POST /operations/run — authenticated bounded operational pass; body `{"mode":"discovery_scan"}`, `{"mode":"drop_watch"}`, or `{"mode":"inventory_scan"}`
 - POST /webhook/validate — live seat validation endpoint used by the gatekeeper flow (requires `X-Webhook-Secret`)
 
@@ -113,6 +114,15 @@ curl -X POST http://localhost:8787/inventory/single-event \
 ```
 
 The endpoint is monitoring-only. For Segerstrom Hall, it saves only target blocks that have the configured number of contiguous, non-overlapping same-or-forward-row backup blocks at the same section, price level, and seat quality. `inventoryBufferBlockCount` lives in the venue runtime configuration and defaults to `2`; set it to `1` to allow one backup block. It never approves a listing or sends an outbound sale action. An optional `target` with `section`, `row`, `seat`, and `price_cents` additionally performs the exact-seat and price-parity checks used at final listing validation.
+
+To test one Tessitura production without changing the scheduled discovery checkpoint:
+
+```bash
+curl -X POST http://localhost:8787/discovery/single-production \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: $WEBHOOK_SHARED_SECRET" \
+  --data '{"production_id":"30573","title":"Phantom of the Opera"}'
+```
 
 All-events inventory uses the same event scan path as `/inventory/single-event`. It resumes one leased D1 job per venue, processing up to `inventoryBatchSize` events or `inventoryMaxRunDurationMs` per cron invocation. Segerstrom defaults are `5` events, `45000` ms, target quantities `[2,6]`, and two backup blocks.
 

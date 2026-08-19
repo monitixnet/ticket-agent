@@ -641,6 +641,18 @@ const run = async () => {
     assert.equal(invalidQuantity.status, 400);
   });
 
+  test('single-production discovery endpoint requires authentication and a numeric production ID', async () => {
+    const denied = await worker.fetch(new Request('https://example.com/discovery/single-production', { method: 'POST', body: '{}' }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(denied.status, 401);
+
+    const invalidProduction = await worker.fetch(new Request('https://example.com/discovery/single-production', {
+      method: 'POST',
+      headers: { 'X-Webhook-Secret': WEBHOOK_SECRET, 'Content-Type': 'application/json' },
+      body: '{"production_id":"not-a-tessitura-id"}'
+    }), { WEBHOOK_SHARED_SECRET: WEBHOOK_SECRET }, {});
+    assert.equal(invalidProduction.status, 400);
+  });
+
   test('automated approval requires two explicit production controls', () => {
     assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true' }), false);
     assert.equal(isSkyboxListingEnabled({ ALLOW_SKYBOX_LISTING: 'true', ENABLE_AUTOMATED_APPROVAL: 'true' }), true);
