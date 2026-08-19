@@ -604,6 +604,7 @@ const run = async () => {
 
   test('production discovery routes the SeatMe settings API through the API provider', async () => {
     let state = null;
+    const persistedStatements = [];
     const fakeDb = {
       prepare(sql) {
         return {
@@ -619,7 +620,10 @@ const run = async () => {
           })
         };
       },
-      batch: async statements => statements.map(() => ({ changes: 1 }))
+      batch: async statements => {
+        persistedStatements.push(...statements);
+        return statements.map(() => ({ changes: 1 }));
+      }
     };
     const settingsRequests = [];
     const adapter = {
@@ -631,7 +635,7 @@ const run = async () => {
     const secureFetch = async (_env, url, _target, options) => {
       if (url.includes('ButtonById')) return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ SubItems: [{ ItemId: 123, Status: 'OnSale', TicketCount: 1 }] }) };
       settingsRequests.push({ url, options });
-      return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show' }] }) };
+      return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show', hallName: 'Segerstrom Hall' }] }) };
     };
     const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show' }], nbPages: 1 }) });
     const RealDate = globalThis.Date;
@@ -648,6 +652,8 @@ const run = async () => {
     }
     assert.equal(settingsRequests.length, 1);
     assert.equal(settingsRequests[0].options.apiRequest, true);
+    const eventInsert = persistedStatements.find(statement => statement.sql?.includes('INSERT OR IGNORE INTO events'));
+    assert.equal(eventInsert.values[4], 'Segerstrom Hall');
   });
 
   test('targets endpoint requires authentication and does not disclose adapter secrets', async () => {
