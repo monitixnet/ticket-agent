@@ -387,8 +387,13 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   if (singleProduction) {
     const productionId = normalizeExternalId(singleProduction.id);
     if (!productionId) throw new Error('single production requires a valid production ID.');
+    // A one-off discovery bypasses the Algolia catalog, which normally
+    // supplies the hall. A sole configured hall is therefore authoritative;
+    // with multiple allowed halls we fail closed rather than guess.
+    const allowedHalls = getDiscoveryAllowedHalls(adapter);
+    const calendarVenueHall = singleProduction.venueHall || (allowedHalls.length === 1 ? allowedHalls[0] : null);
     jobState = {
-      productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`), calendarVenueHall: singleProduction.venueHall || null }],
+      productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`), calendarVenueHall }],
       processedIds: [], totalEventsDiscovered: 0, totalProductions: 1,
       processedProductions: 0, remainingProductions: 1, complete: false,
       lastUpdatedAt: new Date().toISOString(), productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),

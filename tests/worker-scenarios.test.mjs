@@ -29,6 +29,7 @@ import {
 import {
   segerstromDrillDownStrategy,
   segerstromProductionDiscoveryStrategy,
+  segerstromSingleProductionDiscovery,
   resolveCalendarVenueHall,
   resolveVenueHall,
   classifyDiscoveryOutcome,
@@ -638,6 +639,7 @@ const run = async () => {
     let singleBuyButtonRequestCount = 0;
     const adapter = {
       venueName: 'Segerstrom Center for the Arts', timezoneName: 'America/Los_Angeles', algoliaAppId: 'app', algoliaApiKey: 'key', algoliaIndexName: 'index',
+      discoveryAllowedHalls: ['Segerstrom Hall'],
       buyButtonApiUrl: 'https://www.scfta.org/BuyButton/ButtonById',
       settingsApiUrlPattern: 'https://seatme.scfta.org/api/settings/performance/{performanceId}',
       ticketingUrlTemplate: 'https://seatme.scfta.org/single?id={performanceId}'
@@ -677,14 +679,20 @@ const run = async () => {
     };
     try {
       await segerstromProductionDiscoveryStrategy({ venue_id: 'segerstrom_center' }, '', { DB: fakeDb }, {}, secureFetch, () => {}, adapter, apiFetch);
+      const singleResult = await segerstromSingleProductionDiscovery(
+        { venue_id: 'segerstrom_center' },
+        { id: 456, title: 'Example Show One' },
+        { DB: fakeDb }, {}, secureFetch, () => {}, adapter, apiFetch
+      );
+      assert.equal(singleResult.discoveredEvents[0].venueHall, 'Segerstrom Hall');
     } finally {
       globalThis.Date = RealDate;
     }
-    assert.equal(bulkBuyButtonRequests.length, 1);
+    assert.equal(bulkBuyButtonRequests.length, 2);
     assert.match(bulkBuyButtonRequests[0].options.body, /ProdIds%5B%5D=456/);
     assert.match(bulkBuyButtonRequests[0].options.body, /ProdIds%5B%5D=789/);
     assert.equal(singleBuyButtonRequestCount, 0);
-    assert.equal(settingsRequests.length, 2);
+    assert.equal(settingsRequests.length, 3);
     assert.ok(settingsRequests.every(request => request.options.apiRequest === true));
     const eventInsert = persistedStatements.find(statement => statement.sql?.includes('INSERT OR IGNORE INTO events'));
     assert.equal(eventInsert.values[4], 'Segerstrom Hall');
