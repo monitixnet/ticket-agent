@@ -29,6 +29,7 @@ import {
 import {
   segerstromDrillDownStrategy,
   segerstromProductionDiscoveryStrategy,
+  resolveCalendarVenueHall,
   resolveVenueHall,
   classifyDiscoveryOutcome,
   getCurrentSoldOutPerformances,
@@ -205,6 +206,13 @@ const run = async () => {
     assert.equal(resolveVenueHall({ facility: { name: 'Segerstrom Hall' } }, {}), 'Segerstrom Hall');
     assert.equal(resolveVenueHall({ venueName: 'Segerstrom Center for the Arts' }, {}), null);
     assert.equal(resolveVenueHall({}, {}), null);
+  });
+
+  test('Segerstrom calendar hall resolution uses only the calendar Venue array', () => {
+    assert.equal(resolveCalendarVenueHall({ Venue: ['Samueli Theater'] }), 'Samueli Theater');
+    assert.equal(resolveCalendarVenueHall({ Venue: ['  Segerstrom Hall  ', 'Ignored'] }), 'Segerstrom Hall');
+    assert.equal(resolveCalendarVenueHall({ venue: 'Segerstrom Hall' }), null);
+    assert.equal(resolveCalendarVenueHall({}), null);
   });
 
   test('venue timezone inference uses the persisted venue timezone', () => {
@@ -637,7 +645,7 @@ const run = async () => {
       settingsRequests.push({ url, options });
       return { status: 200, routedVia: 'zenrows_api', text: JSON.stringify({ additionalPerformances: [{ performanceId: 123, performanceDate: '2026-12-01T20:00:00Z', description: 'Example Show', hallName: 'Segerstrom Hall' }] }) };
     };
-    const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show' }], nbPages: 1 }) });
+    const apiFetch = async () => ({ status: 200, text: JSON.stringify({ hits: [{ TessituraId: 456, Title: 'Example Show', Venue: ['Segerstrom Hall'] }], nbPages: 1 }) });
     const RealDate = globalThis.Date;
     globalThis.Date = class extends RealDate {
       constructor(value) {

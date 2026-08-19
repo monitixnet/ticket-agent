@@ -124,10 +124,46 @@ export function resolveVenueHall(performance, settingsData) {
     || null;
 }
 
+// SCFTA's public calendar template renders the hall with hit.Venue[0]. Keep
+// this source-specific rule separate from the more conservative SeatMe parser:
+// a generic `venue` field elsewhere must not be mistaken for a hall.
+export function resolveCalendarVenueHall(calendarHit) {
+  const venues = Array.isArray(calendarHit?.Venue) ? calendarHit.Venue : [calendarHit?.Venue];
+  return firstNonEmptyString(venues);
+}
+
+function isDiscoveryHallAllowed(adapter, hallName) {
+  const configured = Array.isArray(adapter?.discoveryAllowedHalls)
+    ? adapter.discoveryAllowedHalls
+    : ['Segerstrom Hall'];
+  const allowed = new Set(configured.map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
+  return allowed.has(String(hallName || '').trim().toLowerCase());
+}
+
 function getObjectFieldNames(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? Object.keys(value).sort().slice(0, 40)
     : [];
+}
+
+function logDiscoveryEndpointShape(env, endpoint, payload, context = {}) {
+  if (env?.DISCOVERY_ENDPOINT_DIAGNOSTICS !== 'true') return;
+  const records = Array.isArray(payload) ? payload : [payload];
+  const samples = records.slice(0, 3).map(record => {
+    const fieldNames = getObjectFieldNames(record);
+    const hallCandidates = Object.fromEntries(Object.entries(record || {})
+      .filter(([key, value]) => /hall|venue|facility|location/i.test(key) && (typeof value === 'string' || typeof value === 'number'))
+      .slice(0, 12));
+    return { fieldNames, hallCandidates };
+  });
+  // Diagnostics are opt-in and deliberately bounded: enough data to map the
+  // real field names and values without logging a full 100-record page.
+  console.log(`[DISCOVERY DIAGNOSTIC] ${endpoint} response sample`, {
+    ...context,
+    recordCount: records.length,
+    samples,
+    rawRecordSamples: records.slice(0, 3)
+  });
 }
 
 function buildUnknownOutcomeSample(productionId, title, button, responseStatus) {
@@ -347,7 +383,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     const productionId = normalizeExternalId(singleProduction.id);
     if (!productionId) throw new Error('single production requires a valid production ID.');
     jobState = {
-      productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`) }],
+      productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`), calendarVenueHall: singleProduction.venueHall || null }],
       processedIds: [], totalEventsDiscovered: 0, totalProductions: 1,
       processedProductions: 0, remainingProductions: 1, complete: false,
       lastUpdatedAt: new Date().toISOString(), productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
@@ -380,7 +416,13 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         return [];
       }
 
-      catalogProductions.push(...searchResults.hits.map(hit => ({ id: normalizeExternalId(hit.TessituraId), title: hit.Title })).filter(p => p.id));
+      logDiscoveryEndpointShape(env, 'algolia_calendar', searchResults.hits, { page, responseStatus: algoliaResponse.status });
+
+      catalogProductions.push(...searchResults.hits.map(hit => ({
+        id: normalizeExternalId(hit.TessituraId),
+        title: hit.Title,
+        calendarVenueHall: resolveCalendarVenueHall(hit)
+      })).filter(p => p.id));
       totalPages = Math.max(1, Number(searchResults.nbPages) || 1);
       page += 1;
     }
@@ -389,8 +431,10 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Discovery stopped at configured page limit.`, { maxPages, totalPages });
     }
     const nowMs = Date.now();
-    const productionQueue = catalogProductions.filter(production => isProductionDueForDiscovery(production, productionSchedule, nowMs));
-    const deferredProductionCount = catalogProductions.length - productionQueue.length;
+    const allowedCatalogProductions = catalogProductions.filter(production => isDiscoveryHallAllowed(adapter, production.calendarVenueHall));
+    const excludedHallCount = catalogProductions.length - allowedCatalogProductions.length;
+    const productionQueue = allowedCatalogProductions.filter(production => isProductionDueForDiscovery(production, productionSchedule, nowMs));
+    const deferredProductionCount = allowedCatalogProductions.length - productionQueue.length;
     jobState = {
       productionQueue,
       processedIds: [],
@@ -407,7 +451,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       deferredProductionCount,
     };
     initialQueueSize = productionQueue.length;
-    console.log(`[PARSER] Created new discovery job with ${productionQueue.length} due productions; deferred ${deferredProductionCount} recently classified production(s) from a ${catalogProductions.length}-production catalog.`);
+    console.log(`[PARSER] Created new discovery job with ${productionQueue.length} due productions; deferred ${deferredProductionCount} recently classified production(s); excluded ${excludedHallCount} production(s) outside the enabled hall allowlist from a ${catalogProductions.length}-production catalog.`);
   } else {
     initialQueueSize = (jobState.productionQueue?.length || 0) + (jobState.processedIds?.length || 0);
     jobState.totalProductions = jobState.totalProductions || initialQueueSize;
@@ -475,7 +519,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     }
 
     const productionToProcess = batchToProcess[batchIndex];
-    const { id: productionSeasonId, title: productionTitle } = productionToProcess;
+    const { id: productionSeasonId, title: productionTitle, calendarVenueHall } = productionToProcess;
     let productionOutcome = 'unknown';
     let buyButton = {};
     const currentItemNumber = (jobState.processedIds?.length || 0) + 1;
@@ -489,9 +533,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         ShouldUseOgMos: 'false',
         KeepPromos: 'false'
       }).toString();
-
       console.log(`[PARSER] Checking for on-sale status via BuyButton API for production ID: ${productionSeasonId}`);
-
       const buttonResponse = await executeSecureFetch(env, adapter.buyButtonApiUrl, targetRow, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
@@ -517,6 +559,8 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
           // button remains {} and will be skipped gracefully
         }
       }
+      logDiscoveryEndpointShape(env, 'buy_button', buyButton, { productionId: productionSeasonId, responseStatus: buttonResponse.status });
+      logDiscoveryEndpointShape(env, 'buy_button_subitems', buyButton?.SubItems || [], { productionId: productionSeasonId });
 
       const onSalePerformanceIdList = [...new Set(
         (buyButton?.SubItems || [])
@@ -535,6 +579,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
           showtime: new Date(showtimeMs).toISOString(),
           eventId: performanceId,
           venueId: targetRow.venue_id,
+          venueHall: calendarVenueHall,
           eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', performanceId)
         });
         soldOutPerformanceIds.push(performanceId);
@@ -579,8 +624,10 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         const additionalPerformances = Array.isArray(settingsData.additionalPerformances)
           ? settingsData.additionalPerformances
           : [];
+        logDiscoveryEndpointShape(env, 'seatme_settings', settingsData, { productionId: productionSeasonId, responseStatus: settingsPayload.status });
+        logDiscoveryEndpointShape(env, 'seatme_settings_performances', additionalPerformances, { productionId: productionSeasonId });
         const performanceHalls = additionalPerformances
-          .map(performance => resolveVenueHall(performance, settingsData));
+          .map(performance => calendarVenueHall || resolveVenueHall(performance, settingsData));
         console.log(`[PARSER] Settings response summary`, {
           productionId: productionSeasonId,
           responseStatus: settingsPayload.status,
@@ -598,7 +645,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
             fieldNames: getObjectFieldNames(performance)
           }));
         if (unresolvedPerformanceSamples.length) {
-          console.warn('[PARSER] Discovery could not resolve a venue hall from the settings payload.', {
+          console.warn('[PARSER] Discovery could not resolve a venue hall from the calendar or settings payload.', {
             productionId: productionSeasonId,
             settingsFieldNames: getObjectFieldNames(settingsData),
             unresolvedPerformanceSamples
@@ -613,7 +660,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
                 showtime: p.performanceDate.replace('T', ' '),
                 eventId: normalizeExternalId(p.performanceId),
                 venueId: targetRow.venue_id,
-                venueHall: resolveVenueHall(p, settingsData),
+                venueHall: calendarVenueHall || resolveVenueHall(p, settingsData),
                 eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
               });
             }

@@ -463,6 +463,17 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
     return { status: 'skipped', reason: 'invalid_adapter' };
   }
 
+  const isDiscovery = logPrefix === '[DISCOVERY SCAN]';
+  if (!isDiscovery) {
+    const hallPolicy = targetRow.venue_hall_id
+      ? await getHallInventoryPolicy(env.DB, targetRow.venue_hall_id)
+      : null;
+    if (!hallPolicy?.inventoryEnabled) {
+      console.log(`${logPrefix} Skipping ${targetRow.show_name}; ${targetRow.venue_hall || 'unclassified hall'} is discovery-only.`);
+      return { status: 'skipped', reason: 'hall_inventory_disabled' };
+    }
+  }
+
   const venueTimezone = inferVenueTimeZone(targetRow.venue_name, null, targetRow.timezone_name);
   if (!isMonitoringWindowActive(now, venueTimezone, adapter.businessHours)) {
     console.log(`${logPrefix} Skipping ${targetRow.show_name}; outside active business window (${venueTimezone}).`);
@@ -487,7 +498,6 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
   }
 
   try {
-    const isDiscovery = logPrefix === '[DISCOVERY SCAN]';
     const urlToScan = isDiscovery ? adapter.urlPattern : targetRow.event_url;
     const strategyName = isDiscovery ? adapter.discoveryStrategy : adapter.inventoryStrategy;
     const effectiveStrategy = strategyName ? STRATEGY_REGISTRY[strategyName] : null;

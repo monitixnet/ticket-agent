@@ -291,6 +291,7 @@ export async function getHallInventoryPolicy(db, venueHallId) {
   try {
     const metadata = JSON.parse(row.metadata_json || '{}');
     return {
+      inventoryEnabled: metadata.inventory_enabled === true,
       seatPositionPolicy: metadata.seat_position_policy || null,
       seatPositionZone: metadata.seat_position_zone || 'unclassified'
     };
