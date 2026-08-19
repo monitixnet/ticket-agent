@@ -8,7 +8,7 @@ This project is a Cloudflare Worker for monitoring event inventory and validatin
 
 Strategy names are intentionally allowlisted in code; D1 selects an approved strategy but cannot execute arbitrary code. Secrets are never stored in D1: `credential_refs_json` contains only a Worker-secret name, such as `ALGOLIA_SEGERSTROM_API_KEY`.
 
-Discovery persists each production's latest sale outcome in D1. A newly observed production is checked once; afterward, on-sale productions are rechecked every six hours, sold-out productions hourly, future/not-on-sale productions daily, and past productions every 30 days. This keeps frequent discovery work focused on actionable catalog changes while preserving eventual rechecks.
+Discovery persists every production's latest sale outcome in D1, including the overall status, sale-start timestamp, and sub-item status counts. Past, not-on-sale, and free-no-ticket productions are recorded as exclusions and removed from recurring discovery. On-sale productions are refreshed every six hours; future-sale productions are rechecked at their advertised sale start; sold-out productions are retained and rechecked hourly until they are linked into the separate drop-watch lane.
 
 ## Local setup
 

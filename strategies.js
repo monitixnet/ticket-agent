@@ -8,10 +8,6 @@ const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
 const DISCOVERY_RECHECK_MS = {
   on_sale: 6 * 60 * 60 * 1000,
   sold_out: 60 * 60 * 1000,
-  future_sale: 24 * 60 * 60 * 1000,
-  not_on_sale: 24 * 60 * 60 * 1000,
-  free_no_tickets: 24 * 60 * 60 * 1000,
-  past: 30 * 24 * 60 * 60 * 1000,
   settings_unavailable: 60 * 60 * 1000,
   unknown: 60 * 60 * 1000,
   error: 30 * 60 * 1000,
@@ -26,24 +22,48 @@ function isProductionDueForDiscovery(production, schedule, nowMs) {
   return !record?.nextCheckAt || Date.parse(record.nextCheckAt) <= nowMs;
 }
 
-function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs) {
-  const intervalMs = DISCOVERY_RECHECK_MS[outcome] ?? DISCOVERY_RECHECK_MS.unknown;
+function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs, buyButton = {}) {
+  let nextCheckAt = null;
+  if (outcome === 'future_sale') {
+    const saleStartMs = Date.parse(buyButton?.MOSStartDate || '');
+    nextCheckAt = Number.isFinite(saleStartMs) && saleStartMs > checkedAtMs
+      ? new Date(saleStartMs).toISOString()
+      : new Date(checkedAtMs + (24 * 60 * 60 * 1000)).toISOString();
+  } else if (Object.hasOwn(DISCOVERY_RECHECK_MS, outcome)) {
+    nextCheckAt = new Date(checkedAtMs + DISCOVERY_RECHECK_MS[outcome]).toISOString();
+  }
+  const subItemStatusCounts = (Array.isArray(buyButton?.SubItems) ? buyButton.SubItems : [])
+    .reduce((counts, item) => {
+      const status = String(item?.Status || 'missing');
+      counts[status] = (counts[status] || 0) + 1;
+      return counts;
+    }, {});
   schedule[production.id] = {
     title: production.title,
     outcome,
     lastCheckedAt: new Date(checkedAtMs).toISOString(),
-    nextCheckAt: new Date(checkedAtMs + intervalMs).toISOString(),
+    nextCheckAt,
+    overallStatus: buyButton?.Status || null,
+    saleStartAt: buyButton?.MOSStartDate || null,
+    subItemStatusCounts,
   };
 }
 
-function classifyDiscoveryOutcome(button, onSalePerformanceIds, now = new Date()) {
+export function classifyDiscoveryOutcome(button, onSalePerformanceIds, now = new Date()) {
   if (onSalePerformanceIds.size > 0) return 'on_sale';
   const maxDate = Date.parse(button?.MaxDate || button?.MOSEndDate || '');
   if (Number.isFinite(maxDate) && maxDate < now.getTime()) return 'past';
   const status = String(button?.Status || '').toLowerCase();
   const subItems = Array.isArray(button?.SubItems) ? button.SubItems : [];
+  // A production can contain both expired PastSale performances and upcoming
+  // SoldOut performances.  Only the latter describes its current drop state.
+  // Keep untimestamped items: without a date we must not discard a status.
+  const currentSubItems = subItems.filter(item => {
+    const ticks = Number(item?.Ticks);
+    return !Number.isFinite(ticks) || ticks >= now.getTime();
+  });
   if (status === 'pastsale') return 'past';
-  if (status === 'soldout' || (subItems.length && subItems.every(item => String(item.Status).toLowerCase() === 'soldout'))) return 'sold_out';
+  if (status === 'soldout' || (currentSubItems.length && currentSubItems.every(item => String(item.Status).toLowerCase() === 'soldout'))) return 'sold_out';
   if (status === 'freenotixs') return 'free_no_tickets';
   const saleStart = Date.parse(button?.MOSStartDate || '');
   if (Number.isFinite(saleStart) && saleStart > now.getTime()) return 'future_sale';
@@ -429,6 +449,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     const productionToProcess = batchToProcess[batchIndex];
     const { id: productionSeasonId, title: productionTitle } = productionToProcess;
     let productionOutcome = 'unknown';
+    let buyButton = {};
     const currentItemNumber = (jobState.processedIds?.length || 0) + 1;
     console.log(`\n[PARSER] Processing production ${currentItemNumber} of ${initialQueueSize}: "${productionTitle}" (ID: ${productionSeasonId})`);
 
@@ -455,15 +476,13 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         responseStatus: buttonResponse?.status
       });
 
-      let button = {};
-
       if (!buttonResponse) {
         throw new Error('BuyButton returned no response object.');
       }
 
       if (buttonResponse?.text && typeof buttonResponse.text === 'string') {
         try {
-          button = JSON.parse(buttonResponse.text);
+          buyButton = JSON.parse(buttonResponse.text);
         } catch (e) {
           trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Failed to parse BuyButton API response.`, { productionId: productionSeasonId, error: e.message, responseText: buttonResponse.text.slice(0, 200) });
           // button remains {} and will be skipped gracefully
@@ -471,14 +490,14 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       }
 
       const onSalePerformanceIdList = [...new Set(
-        (button?.SubItems || [])
+        (buyButton?.SubItems || [])
           .filter(item => item.Status === 'OnSale' && Number(item.TicketCount) > 0)
           .map(item => normalizeExternalId(item.ItemId))
       )];
       const onSalePerformanceIds = new Set(onSalePerformanceIdList);
-      productionOutcome = classifyDiscoveryOutcome(button, onSalePerformanceIds);
+      productionOutcome = classifyDiscoveryOutcome(buyButton, onSalePerformanceIds);
       if (productionOutcome === 'unknown') {
-        const sample = buildUnknownOutcomeSample(productionSeasonId, productionTitle, button, buttonResponse.status);
+        const sample = buildUnknownOutcomeSample(productionSeasonId, productionTitle, buyButton, buttonResponse.status);
         unknownOutcomeSamplesInRun.push(sample);
         if (jobState.unknownOutcomeSamples.length < UNKNOWN_OUTCOME_SAMPLE_LIMIT) {
           jobState.unknownOutcomeSamples.push(sample);
@@ -547,14 +566,14 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       } else {
         // Enhance logging to summarize the statuses of sub-items if they exist.
         let subItemSummary = 'no sub-items found';
-        if (button?.SubItems?.length > 0) {
-          const statusCounts = button.SubItems.reduce((acc, item) => {
+        if (buyButton?.SubItems?.length > 0) {
+          const statusCounts = buyButton.SubItems.reduce((acc, item) => {
             acc[item.Status] = (acc[item.Status] || 0) + 1;
             return acc;
           }, {});
           subItemSummary = `sub-item statuses: ${JSON.stringify(statusCounts)}`;
         }
-        console.log(`[PARSER] Skipping production ${productionSeasonId} ("${productionTitle}") because its overall status is "${button.Status}" (HTTP: ${buttonResponse.status}) and no on-sale performances were found (${subItemSummary}).`);
+        console.log(`[PARSER] Skipping production ${productionSeasonId} ("${productionTitle}") because its overall status is "${buyButton.Status}" (HTTP: ${buttonResponse.status}) and no on-sale performances were found (${subItemSummary}).`);
       }
     } catch (err) {
       failedProductionCount += 1;
@@ -567,7 +586,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     jobState.productionOutcomeCounts[productionOutcome] += 1;
     jobState.processedIds.push(productionSeasonId);
     processedThisRun.push(productionSeasonId);
-    if (!singleProduction) scheduleProductionRecheck(productionSchedule, productionToProcess, productionOutcome, Date.now());
+    if (!singleProduction) scheduleProductionRecheck(productionSchedule, productionToProcess, productionOutcome, Date.now(), buyButton);
   }
 
   // Persist events before checkpointing the queue. If persistence fails, the

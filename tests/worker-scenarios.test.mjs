@@ -29,7 +29,8 @@ import {
 import {
   segerstromDrillDownStrategy,
   segerstromProductionDiscoveryStrategy,
-  resolveVenueHall
+  resolveVenueHall,
+  classifyDiscoveryOutcome
 } from '../strategies.js';
 import {
   getNextUpcomingEvent,
@@ -56,6 +57,19 @@ const run = async () => {
 
   test('business window is closed before 7:30 AM local venue time', () => {
     assert.equal(isMonitoringWindowActive(new Date('2026-08-03T06:00:00-07:00'), 'America/Los_Angeles'), false);
+  });
+
+  test('current sold-out performances are monitored even when a production also contains past performances', () => {
+    const now = new Date('2026-08-19T12:00:00.000Z');
+    const outcome = classifyDiscoveryOutcome({
+      Status: 'NotOnSale',
+      MaxDate: '2026-08-30T01:00:00Z',
+      SubItems: [
+        { Status: 'PastSale', Ticks: now.getTime() - 60_000 },
+        { Status: 'SoldOut', Ticks: now.getTime() + 60_000 },
+      ]
+    }, new Set(), now);
+    assert.equal(outcome, 'sold_out');
   });
 
   test('equivalent coverage passes when 3X requirement is met', () => {
