@@ -366,8 +366,8 @@ export async function clearDiscoveryJobState(db, jobKey) {
 }
 
 // Retains the last known sale outcome independently of the resumable queue.
-// This lets a new catalog pass defer productions that were recently confirmed
-// as past or not on sale, without ever losing the ability to recheck them.
+// This lets a new catalog pass permanently exclude terminal outcomes while
+// retaining a durable audit record of what was observed.
 export async function getDiscoveryProductionSchedule(db, venueId) {
   const row = await db.prepare('SELECT value_string FROM system_state WHERE key_name = ?')
     .bind(`discovery_production_schedule:${venueId}`)
@@ -385,6 +385,21 @@ export async function setDiscoveryProductionSchedule(db, venueId, schedule) {
   return db.prepare('INSERT OR REPLACE INTO system_state (key_name, value_string) VALUES (?, ?)')
     .bind(`discovery_production_schedule:${venueId}`, JSON.stringify(schedule || {}))
     .run();
+}
+
+// Discovery can observe a performance as sold out before it has ever been
+// through broad inventory. Seed that state only once so a later successful
+// inventory scan remains the authoritative live availability observation.
+export async function markDiscoveredSoldOutEvents(db, eventIds = [], observedAt) {
+  const uniqueEventIds = [...new Set(eventIds.filter(Boolean))];
+  if (!uniqueEventIds.length) return 0;
+  const timestamp = observedAt || new Date().toISOString();
+  const statements = uniqueEventIds.map(eventId => db.prepare(`INSERT INTO event_inventory_state (
+    event_id, availability_state, available_item_count, last_scan_id, last_observed_at, updated_at
+  ) VALUES (?, 'sold_out', 0, NULL, ?, ?)
+  ON CONFLICT(event_id) DO NOTHING`).bind(eventId, timestamp, timestamp));
+  await db.batch(statements);
+  return uniqueEventIds.length;
 }
 
 // Discovery checkpoints are stored as JSON in system_state. Use a separate,
@@ -510,10 +525,16 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
     for (const event of events) {
       const existing = existingEventMap.get(event.normalizedEventId);
       if (existing) {
-        const showtimeChanged = String(existing.showtime || '') !== String(event.showtime || '');
-        const urlChanged = String(existing.event_url || '') !== String(event.eventUrl || '');
-        const hallChanged = String(existing.venue_hall || '') !== String(event.venueHall || '');
-        const hallIdChanged = String(existing.venue_hall_id || '') !== String(event.venueHallId || '');
+        // A sold-out BuyButton response has no settings payload. Do not erase
+        // previously discovered showtime, URL, or hall metadata with nulls.
+        const showtime = event.showtime || existing.showtime;
+        const eventUrl = event.eventUrl || existing.event_url;
+        const venueHall = event.venueHall || existing.venue_hall;
+        const venueHallId = event.venueHallId || existing.venue_hall_id;
+        const showtimeChanged = String(existing.showtime || '') !== String(showtime || '');
+        const urlChanged = String(existing.event_url || '') !== String(eventUrl || '');
+        const hallChanged = String(existing.venue_hall || '') !== String(venueHall || '');
+        const hallIdChanged = String(existing.venue_hall_id || '') !== String(venueHallId || '');
 
         if (showtimeChanged || urlChanged || hallChanged || hallIdChanged) {
           const eventUpdateTarget = db.prepare(
@@ -521,7 +542,7 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
           );
           statements.push({
             kind: 'event_update',
-            statement: eventUpdateTarget.bind(showId, event.showtime, event.eventUrl, event.venueHall || null, event.venueHallId, event.normalizedEventId)
+            statement: eventUpdateTarget.bind(showId, showtime, eventUrl, venueHall || null, venueHallId, event.normalizedEventId)
           });
         }
         continue;

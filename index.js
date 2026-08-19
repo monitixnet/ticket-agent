@@ -343,6 +343,7 @@ async function executeApiFetch(url, options = {}) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      consumeExternalRequestBudget(options.requestBudget, `API ${method} ${url}`);
       // Add a newline for visual separation in logs between attempts.
       const attemptMsg = `\n[API FETCH] Attempt ${attempt}/${retries} for -> ${url}`;
       if (debugLog) debugLog(attemptMsg, 'info');
@@ -371,6 +372,7 @@ async function executeApiFetch(url, options = {}) {
       return { text: responseText, status: res.status, routedVia: 'apiFetchProvider' };
 
     } catch (err) {
+      if (err?.code === 'SUBREQUEST_BUDGET_EXHAUSTED') throw err;
       console.error(`[API FETCH] Network error on attempt ${attempt}: ${err.message}`);
       if (attempt < retries) {
         const backoffMs = initialBackoff * Math.pow(2, attempt - 1) + randomBetween(500, 1500);
@@ -416,6 +418,7 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
     }
 
     try {
+      consumeExternalRequestBudget(fetchOptions.requestBudget, `${providerName} ${method} ${targetUrlString}`);
       const result = await provider(env, targetUrlString, targetRow, fetchOptions);
       lastResult = result;
 
@@ -430,6 +433,7 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
       // If we get a successful response, return it immediately.
       return result;
     } catch (err) {
+      if (err?.code === 'SUBREQUEST_BUDGET_EXHAUSTED') throw err;
       console.error(`[PROVIDER POOL] Provider ${providerName} threw an exception: ${err.message}. Attempting next provider.`);
       lastResult = { status: 500, text: err.message, routedVia: providerName };
     }
@@ -438,6 +442,16 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
   // If all providers in the pool failed, return the last known result.
   console.error(`[PROVIDER POOL] All fetch providers failed. Returning last known result.`);
   return lastResult || { status: 503, text: 'All fetch providers in the pool failed.', routedVia: 'provider_pool' };
+}
+
+function consumeExternalRequestBudget(requestBudget, requestLabel) {
+  if (!requestBudget) return;
+  if (!Number.isFinite(requestBudget.remaining) || requestBudget.remaining < 1) {
+    const error = new Error(`External subrequest budget exhausted before ${requestLabel}.`);
+    error.code = 'SUBREQUEST_BUDGET_EXHAUSTED';
+    throw error;
+  }
+  requestBudget.remaining -= 1;
 }
 
 async function executeScanForTarget(targetRow, env, ctx, options = {}) {

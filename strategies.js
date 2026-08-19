@@ -1,10 +1,11 @@
 import { VENUE_PARSERS } from './venue-rules.js';
-import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
+import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, markDiscoveredSoldOutEvents, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 import { isMonitoringWindowActive } from './venue-logic.js';
 
 const DISCOVERY_OUTCOMES = ['on_sale', 'sold_out', 'future_sale', 'past', 'not_on_sale', 'free_no_tickets', 'settings_unavailable', 'unknown', 'error'];
 const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
+const DISCOVERY_EXTERNAL_REQUEST_BUDGET = 45;
 const DISCOVERY_RECHECK_MS = {
   on_sale: 6 * 60 * 60 * 1000,
   sold_out: 60 * 60 * 1000,
@@ -17,9 +18,12 @@ function emptyDiscoveryOutcomeCounts() {
   return Object.fromEntries(DISCOVERY_OUTCOMES.map(outcome => [outcome, 0]));
 }
 
-function isProductionDueForDiscovery(production, schedule, nowMs) {
+export function isProductionDueForDiscovery(production, schedule, nowMs) {
   const record = schedule?.[production.id];
-  return !record?.nextCheckAt || Date.parse(record.nextCheckAt) <= nowMs;
+  if (!record) return true;
+  if (record.nextCheckAt === null) return false; // recorded permanent exclusion
+  const nextCheckMs = Date.parse(record.nextCheckAt || '');
+  return !Number.isFinite(nextCheckMs) || nextCheckMs <= nowMs;
 }
 
 function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs, buyButton = {}) {
@@ -71,6 +75,15 @@ export function classifyDiscoveryOutcome(button, onSalePerformanceIds, now = new
   return 'unknown';
 }
 
+export function getCurrentSoldOutPerformances(button, now = new Date()) {
+  return (Array.isArray(button?.SubItems) ? button.SubItems : [])
+    .filter(item => String(item?.Status || '').toLowerCase() === 'soldout')
+    .filter(item => {
+      const ticks = Number(item?.Ticks);
+      return Number.isFinite(ticks) && ticks >= now.getTime();
+    });
+}
+
 function firstNonEmptyString(values) {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim();
@@ -78,18 +91,23 @@ function firstNonEmptyString(values) {
   return null;
 }
 
+const EXPLICIT_HALL_FIELD_NAMES = new Set([
+  'hall', 'hallname', 'venuehall', 'venue_hall', 'facility', 'facilityname', 'facility_name', 'facilitysettings',
+  'locationname', 'location_name', 'performancelocation', 'performancevenue'
+]);
+
 function extractHallFromRecord(record) {
   if (!record || typeof record !== 'object') return null;
   const directHall = firstNonEmptyString([
-    record.venueHall, record.hallName, record.hall,
-    record.venueName, record.facilityName, record.locationName
+    record.venueHall, record.hallName, record.hall, record.facilityName, record.locationName
   ]);
   if (directHall) return directHall;
 
-  for (const nestedValue of [record.venue, record.facility, record.location, record.performanceVenue, record.performanceLocation]) {
+  for (const [key, nestedValue] of Object.entries(record)) {
+    if (!EXPLICIT_HALL_FIELD_NAMES.has(String(key).toLowerCase())) continue;
     if (typeof nestedValue === 'string' && nestedValue.trim()) return nestedValue.trim();
     if (nestedValue && typeof nestedValue === 'object') {
-      const nestedHall = firstNonEmptyString([nestedValue.name, nestedValue.hallName, nestedValue.venueName, nestedValue.facilityName, nestedValue.description]);
+      const nestedHall = firstNonEmptyString([nestedValue.hallName, nestedValue.facilityName, nestedValue.locationName, nestedValue.name, nestedValue.description]);
       if (nestedHall) return nestedHall;
     }
   }
@@ -104,6 +122,12 @@ export function resolveVenueHall(performance, settingsData) {
     || extractHallFromRecord(settingsData)
     || extractHallFromRecord(settingsData?.facilitySettings)
     || null;
+}
+
+function getObjectFieldNames(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.keys(value).sort().slice(0, 40)
+    : [];
 }
 
 function buildUnknownOutcomeSample(productionId, title, button, responseStatus) {
@@ -311,6 +335,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
 
   const JOB_KEY = `segerstrom_discovery_job`;
   const singleProduction = options.singleProduction || null;
+  const requestBudget = { remaining: DISCOVERY_EXTERNAL_REQUEST_BUDGET };
   let initialQueueSize = 0;
   let jobState = singleProduction ? null : await getDiscoveryJobState(env.DB, JOB_KEY);
   const productionSchedule = singleProduction ? {} : await getDiscoveryProductionSchedule(env.DB, targetRow.venue_id);
@@ -345,7 +370,9 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       const algoliaResponse = await executeApiFetch(algoliaUrl, {
         method: 'POST',
         body: JSON.stringify(algoliaPayload),
-        headers
+        headers,
+        retries: 1,
+        requestBudget
       });
       const searchResults = JSON.parse(algoliaResponse.text || '{}');
       if (!Array.isArray(searchResults.hits)) {
@@ -431,6 +458,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   console.log(`[PARSER] Discovery progress: run=${jobRunNumber}/${estimatedInitialRuns}, completed=${jobState.processedIds?.length || 0}, remainingInQueue=${jobState.productionQueue.length}, batchSize=${BATCH_SIZE}, totalKnown=${totalRemainingBeforeBatch}, complete=${jobState.complete || false}`);
 
   const allDiscoveredEvents = [];
+  const soldOutPerformanceIds = [];
   const processedThisRun = [];
   const batchStartedAt = Date.now();
   const batchStartedAtIso = new Date(batchStartedAt).toISOString();
@@ -467,7 +495,8 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       const buttonResponse = await executeSecureFetch(env, adapter.buyButtonApiUrl, targetRow, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
-        body: buttonApiBody
+        body: buttonApiBody,
+        requestBudget
       });
 
       console.log(`[PARSER] BuyButton response`, {
@@ -496,6 +525,20 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       )];
       const onSalePerformanceIds = new Set(onSalePerformanceIdList);
       productionOutcome = classifyDiscoveryOutcome(buyButton, onSalePerformanceIds);
+      const currentSoldOutPerformances = getCurrentSoldOutPerformances(buyButton);
+      for (const performance of currentSoldOutPerformances) {
+        const performanceId = normalizeExternalId(performance.ItemId);
+        const showtimeMs = Number(performance.Ticks);
+        if (!performanceId || !Number.isFinite(showtimeMs)) continue;
+        allDiscoveredEvents.push({
+          showName: productionTitle,
+          showtime: new Date(showtimeMs).toISOString(),
+          eventId: performanceId,
+          venueId: targetRow.venue_id,
+          eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', performanceId)
+        });
+        soldOutPerformanceIds.push(performanceId);
+      }
       if (productionOutcome === 'unknown') {
         const sample = buildUnknownOutcomeSample(productionSeasonId, productionTitle, buyButton, buttonResponse.status);
         unknownOutcomeSamplesInRun.push(sample);
@@ -513,7 +556,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
           if (!settingsUrl) throw new Error('settingsApiUrlPattern is not configured in the adapter.');
 
           console.log(`[PARSER] Fetching settings for production "${productionTitle}" via performanceId: ${performanceId}`);
-          const candidatePayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
+          const candidatePayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true, requestBudget });
           if (candidatePayload.status >= 200 && candidatePayload.status < 300) {
             settingsPayload = candidatePayload;
             representativePerformanceId = performanceId;
@@ -547,6 +590,20 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
           venueHalls: [...new Set(performanceHalls.filter(Boolean))],
           performancesMissingVenueHall: performanceHalls.filter(hall => !hall).length
         });
+        const unresolvedPerformanceSamples = additionalPerformances
+          .filter((performance, index) => !performanceHalls[index])
+          .slice(0, 3)
+          .map(performance => ({
+            performanceId: normalizeExternalId(performance?.performanceId || performance?.id),
+            fieldNames: getObjectFieldNames(performance)
+          }));
+        if (unresolvedPerformanceSamples.length) {
+          console.warn('[PARSER] Discovery could not resolve a venue hall from the settings payload.', {
+            productionId: productionSeasonId,
+            settingsFieldNames: getObjectFieldNames(settingsData),
+            unresolvedPerformanceSamples
+          });
+        }
 
         if (additionalPerformances.length) {
           for (const p of additionalPerformances) {
@@ -576,6 +633,12 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         console.log(`[PARSER] Skipping production ${productionSeasonId} ("${productionTitle}") because its overall status is "${buyButton.Status}" (HTTP: ${buttonResponse.status}) and no on-sale performances were found (${subItemSummary}).`);
       }
     } catch (err) {
+      if (err?.code === 'SUBREQUEST_BUDGET_EXHAUSTED') {
+        const deferredProductions = batchToProcess.slice(batchIndex);
+        jobState.productionQueue.unshift(...deferredProductions);
+        console.warn(`[PARSER] External subrequest budget reached (${DISCOVERY_EXTERNAL_REQUEST_BUDGET}); checkpointing ${deferredProductions.length} production(s) for the next invocation.`);
+        break;
+      }
       failedProductionCount += 1;
       productionOutcome = 'error';
       console.error(`[PARSER - ${adapter.venueName}] Production ${productionSeasonId} failed: ${err.message}`);
@@ -592,6 +655,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   // Persist events before checkpointing the queue. If persistence fails, the
   // batch will safely be retried on the next run instead of being lost.
   const upsertResult = await upsertDiscoveredEvents(env.DB, allDiscoveredEvents);
+  const soldOutEventsEnrolled = await markDiscoveredSoldOutEvents(env.DB, soldOutPerformanceIds, new Date().toISOString());
   jobState.totalEventsDiscovered = (jobState.totalEventsDiscovered || 0) + (upsertResult.inserted || 0);
   jobState.processedProductions = jobState.processedIds.length;
   jobState.remainingProductions = jobState.productionQueue.length;
@@ -612,6 +676,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     processedProductions: processedThisRun.length,
     discoveredEvents: allDiscoveredEvents.length,
     insertedEvents: upsertResult.inserted,
+    soldOutEventsEnrolled,
     durationMs: batchDurationMs,
     averageMsPerProduction,
     outcomes: batchOutcomeCounts,

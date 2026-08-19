@@ -30,13 +30,16 @@ import {
   segerstromDrillDownStrategy,
   segerstromProductionDiscoveryStrategy,
   resolveVenueHall,
-  classifyDiscoveryOutcome
+  classifyDiscoveryOutcome,
+  getCurrentSoldOutPerformances,
+  isProductionDueForDiscovery
 } from '../strategies.js';
 import {
   getNextUpcomingEvent,
   getNextEventWithActiveListing,
   getListingForValidation,
   upsertDiscoveredEvents,
+  markDiscoveredSoldOutEvents,
 } from '../database/queries.js';
 import { normalizeExternalId } from '../utils.js';
 import { getActiveVenueAdapters } from '../database/venue-runtime-config.js';
@@ -70,6 +73,45 @@ const run = async () => {
       ]
     }, new Set(), now);
     assert.equal(outcome, 'sold_out');
+  });
+
+  test('recorded exclusions are not due again, while scheduled and malformed records are handled safely', () => {
+    const production = { id: 'excluded-production' };
+    const nowMs = Date.parse('2026-08-19T12:00:00.000Z');
+    assert.equal(isProductionDueForDiscovery(production, {
+      'excluded-production': { outcome: 'past', nextCheckAt: null }
+    }, nowMs), false);
+    assert.equal(isProductionDueForDiscovery(production, {
+      'excluded-production': { outcome: 'sold_out', nextCheckAt: '2026-08-19T11:59:59.000Z' }
+    }, nowMs), true);
+    assert.equal(isProductionDueForDiscovery(production, {
+      'excluded-production': { outcome: 'unknown', nextCheckAt: 'not-a-date' }
+    }, nowMs), true);
+  });
+
+  test('only future sold-out performances are enrolled for drop monitoring', () => {
+    const now = new Date('2026-08-19T12:00:00.000Z');
+    const performances = getCurrentSoldOutPerformances({ SubItems: [
+      { ItemId: 1, Status: 'SoldOut', Ticks: now.getTime() - 1 },
+      { ItemId: 2, Status: 'SoldOut', Ticks: now.getTime() + 1 },
+      { ItemId: 3, Status: 'PastSale', Ticks: now.getTime() + 1 },
+      { ItemId: 4, Status: 'SoldOut' }
+    ] }, now);
+    assert.deepEqual(performances.map(item => item.ItemId), [2]);
+  });
+
+  test('discovery can seed sold-out events into the existing drop-watch state machine', async () => {
+    const statements = [];
+    const fakeDb = {
+      prepare: sql => ({ bind: (...values) => ({ sql, values }) }),
+      batch: async batch => { statements.push(...batch); return batch.map(() => ({ changes: 1 })); }
+    };
+    const enrolled = await markDiscoveredSoldOutEvents(fakeDb, ['performance-1', 'performance-1', 'performance-2'], '2026-08-19T12:00:00.000Z');
+    assert.equal(enrolled, 2);
+    assert.equal(statements.length, 2);
+    assert.ok(statements.every(statement => statement.sql.includes("VALUES (?, 'sold_out', 0")));
+    assert.ok(statements.every(statement => statement.sql.includes('ON CONFLICT(event_id) DO NOTHING')));
+    assert.ok(statements.every(statement => statement.values.includes('2026-08-19T12:00:00.000Z')));
   });
 
   test('equivalent coverage passes when 3X requirement is met', () => {
@@ -153,13 +195,15 @@ const run = async () => {
 
   test('discovery hall resolution prefers a performance-specific hall over a venue fallback', () => {
     assert.equal(resolveVenueHall(
-      { venueName: 'Samueli Theater' },
+      { hallName: 'Samueli Theater' },
       { facilitySettings: { facilityName: 'Segerstrom Hall' } }
     ), 'Samueli Theater');
     assert.equal(resolveVenueHall(
       {},
       { facilitySettings: { facilityName: 'Segerstrom Hall' } }
     ), 'Segerstrom Hall');
+    assert.equal(resolveVenueHall({ facility: { name: 'Segerstrom Hall' } }, {}), 'Segerstrom Hall');
+    assert.equal(resolveVenueHall({ venueName: 'Segerstrom Center for the Arts' }, {}), null);
     assert.equal(resolveVenueHall({}, {}), null);
   });
 
