@@ -20,9 +20,9 @@ async function nativeFetchProvider(_env, targetUrlString, _targetRow, fetchOptio
 // ScrapFly preserves the upstream method, body, and request headers. That is
 // essential for Tessitura's form-encoded BuyButton POST endpoint; a browser
 // proxy that turns it into a navigation would return the wrong response.
-async function scrapeflyProvider(env, targetUrlString, _targetRow, fetchOptions = {}) {
+async function scrapflyProvider(env, targetUrlString, _targetRow, fetchOptions = {}) {
   const apiKey = env.SCRAPEFLY_API_KEY;
-  if (!apiKey) throw new Error('Missing SCRAPEFLY_API_KEY for scrapeflyProvider.');
+  if (!apiKey) throw new Error('Missing SCRAPEFLY_API_KEY for scrapflyProvider.');
   const params = new URLSearchParams({
     key: apiKey,
     url: targetUrlString,
@@ -45,13 +45,13 @@ async function scrapeflyProvider(env, targetUrlString, _targetRow, fetchOptions 
   try {
     payload = JSON.parse(responseText);
   } catch {
-    return { text: responseText, status: response.status, routedVia: 'scrapeflyProvider' };
+    return { text: responseText, status: response.status, routedVia: 'scrapflyProvider' };
   }
   const result = payload?.result || {};
   return {
     text: typeof result.content === 'string' ? result.content : responseText,
     status: Number(result.status_code) || response.status,
-    routedVia: 'scrapeflyProvider'
+    routedVia: 'scrapflyProvider'
   };
 }
 
@@ -295,7 +295,7 @@ async function zenrowsBrowserProvider(env, targetUrlString) {
 
 export const FETCH_PROVIDERS = {
   native: nativeFetchProvider,
-  scrapefly: scrapeflyProvider,
+  scrapfly: scrapflyProvider,
   zenrows_browser: zenrowsBrowserProvider,
   zenrows_api: zenrowsApiProxyProvider,
 };
