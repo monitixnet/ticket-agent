@@ -365,6 +365,28 @@ export async function clearDiscoveryJobState(db, jobKey) {
     .run();
 }
 
+// Retains the last known sale outcome independently of the resumable queue.
+// This lets a new catalog pass defer productions that were recently confirmed
+// as past or not on sale, without ever losing the ability to recheck them.
+export async function getDiscoveryProductionSchedule(db, venueId) {
+  const row = await db.prepare('SELECT value_string FROM system_state WHERE key_name = ?')
+    .bind(`discovery_production_schedule:${venueId}`)
+    .first();
+  if (!row?.value_string) return {};
+  try {
+    const value = JSON.parse(row.value_string);
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function setDiscoveryProductionSchedule(db, venueId, schedule) {
+  return db.prepare('INSERT OR REPLACE INTO system_state (key_name, value_string) VALUES (?, ?)')
+    .bind(`discovery_production_schedule:${venueId}`, JSON.stringify(schedule || {}))
+    .run();
+}
+
 // Discovery checkpoints are stored as JSON in system_state. Use a separate,
 // compare-and-set lease key so an overlapping cron cannot read the same queue
 // and process the same production batch twice. A cancelled Worker naturally

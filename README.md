@@ -8,6 +8,8 @@ This project is a Cloudflare Worker for monitoring event inventory and validatin
 
 Strategy names are intentionally allowlisted in code; D1 selects an approved strategy but cannot execute arbitrary code. Secrets are never stored in D1: `credential_refs_json` contains only a Worker-secret name, such as `ALGOLIA_SEGERSTROM_API_KEY`.
 
+Discovery persists each production's latest sale outcome in D1. A newly observed production is checked once; afterward, on-sale productions are rechecked every six hours, sold-out productions hourly, future/not-on-sale productions daily, and past productions every 30 days. This keeps frequent discovery work focused on actionable catalog changes while preserving eventual rechecks.
+
 ## Local setup
 
 Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The Worker uses a Cloudflare D1 database configured in `wrangler.jsonc`.

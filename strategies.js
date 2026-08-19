@@ -1,13 +1,39 @@
 import { VENUE_PARSERS } from './venue-rules.js';
-import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
+import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 import { isMonitoringWindowActive } from './venue-logic.js';
 
 const DISCOVERY_OUTCOMES = ['on_sale', 'sold_out', 'future_sale', 'past', 'not_on_sale', 'free_no_tickets', 'settings_unavailable', 'unknown', 'error'];
 const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
+const DISCOVERY_RECHECK_MS = {
+  on_sale: 6 * 60 * 60 * 1000,
+  sold_out: 60 * 60 * 1000,
+  future_sale: 24 * 60 * 60 * 1000,
+  not_on_sale: 24 * 60 * 60 * 1000,
+  free_no_tickets: 24 * 60 * 60 * 1000,
+  past: 30 * 24 * 60 * 60 * 1000,
+  settings_unavailable: 60 * 60 * 1000,
+  unknown: 60 * 60 * 1000,
+  error: 30 * 60 * 1000,
+};
 
 function emptyDiscoveryOutcomeCounts() {
   return Object.fromEntries(DISCOVERY_OUTCOMES.map(outcome => [outcome, 0]));
+}
+
+function isProductionDueForDiscovery(production, schedule, nowMs) {
+  const record = schedule?.[production.id];
+  return !record?.nextCheckAt || Date.parse(record.nextCheckAt) <= nowMs;
+}
+
+function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs) {
+  const intervalMs = DISCOVERY_RECHECK_MS[outcome] ?? DISCOVERY_RECHECK_MS.unknown;
+  schedule[production.id] = {
+    title: production.title,
+    outcome,
+    lastCheckedAt: new Date(checkedAtMs).toISOString(),
+    nextCheckAt: new Date(checkedAtMs + intervalMs).toISOString(),
+  };
 }
 
 function classifyDiscoveryOutcome(button, onSalePerformanceIds, now = new Date()) {
@@ -267,6 +293,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   const singleProduction = options.singleProduction || null;
   let initialQueueSize = 0;
   let jobState = singleProduction ? null : await getDiscoveryJobState(env.DB, JOB_KEY);
+  const productionSchedule = singleProduction ? {} : await getDiscoveryProductionSchedule(env.DB, targetRow.venue_id);
 
   // Start only when there is no saved job. An existing job with an empty queue
   // must reach the completion branch below so it can log completion and clear
@@ -289,7 +316,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
     const headers = { 'Content-Type': 'application/json', 'X-Algolia-Application-Id': algoliaAppId, 'X-Algolia-API-Key': algoliaApiKey };
     const maxPages = Math.max(1, Math.min(Number(env.DISCOVERY_MAX_PAGES) || 100, 100));
-    const productionQueue = [];
+    const catalogProductions = [];
     let page = 0;
     let totalPages = 1;
 
@@ -306,7 +333,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
         return [];
       }
 
-      productionQueue.push(...searchResults.hits.map(hit => ({ id: normalizeExternalId(hit.TessituraId), title: hit.Title })).filter(p => p.id));
+      catalogProductions.push(...searchResults.hits.map(hit => ({ id: normalizeExternalId(hit.TessituraId), title: hit.Title })).filter(p => p.id));
       totalPages = Math.max(1, Number(searchResults.nbPages) || 1);
       page += 1;
     }
@@ -314,6 +341,9 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     if (page < totalPages) {
       trackWorkerLog(env, ctx, 'warn', `[PARSER - ${adapter.venueName}] Discovery stopped at configured page limit.`, { maxPages, totalPages });
     }
+    const nowMs = Date.now();
+    const productionQueue = catalogProductions.filter(production => isProductionDueForDiscovery(production, productionSchedule, nowMs));
+    const deferredProductionCount = catalogProductions.length - productionQueue.length;
     jobState = {
       productionQueue,
       processedIds: [],
@@ -326,9 +356,11 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
       unknownOutcomeSamples: [],
       runCount: 0,
+      catalogProductionCount: catalogProductions.length,
+      deferredProductionCount,
     };
     initialQueueSize = productionQueue.length;
-    console.log(`[PARSER] Created new discovery job with ${productionQueue.length} productions.`);
+    console.log(`[PARSER] Created new discovery job with ${productionQueue.length} due productions; deferred ${deferredProductionCount} recently classified production(s) from a ${catalogProductions.length}-production catalog.`);
   } else {
     initialQueueSize = (jobState.productionQueue?.length || 0) + (jobState.processedIds?.length || 0);
     jobState.totalProductions = jobState.totalProductions || initialQueueSize;
@@ -345,7 +377,10 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
 
   // Process a polite, bounded chunk per scheduled invocation. This remains
   // sequential within the batch to avoid bursts against the venue.
-  const BATCH_SIZE = singleProduction ? 1 : Math.max(1, Math.min(Number(adapter.discoveryBatchSize ?? env.DISCOVERY_BATCH_SIZE) || 30, 50));
+  // Native-only production discovery needs room for BuyButton + settings calls
+  // for every on-sale production, so never let an adapter request an unsafe 30+
+  // production invocation.
+  const BATCH_SIZE = singleProduction ? 1 : Math.max(1, Math.min(Number(adapter.discoveryBatchSize ?? env.DISCOVERY_BATCH_SIZE) || 18, 18));
   const totalRemainingBeforeBatch = jobState.productionQueue.length + (jobState.processedIds?.length || 0);
   const batchToProcess = jobState.productionQueue.splice(0, BATCH_SIZE);
 
@@ -532,6 +567,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     jobState.productionOutcomeCounts[productionOutcome] += 1;
     jobState.processedIds.push(productionSeasonId);
     processedThisRun.push(productionSeasonId);
+    if (!singleProduction) scheduleProductionRecheck(productionSchedule, productionToProcess, productionOutcome, Date.now());
   }
 
   // Persist events before checkpointing the queue. If persistence fails, the
@@ -545,6 +581,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   jobState.complete = jobState.productionQueue.length === 0;
   jobState.lastUpdatedAt = new Date().toISOString();
   if (!singleProduction) await setDiscoveryJobState(env.DB, JOB_KEY, jobState);
+  if (!singleProduction) await setDiscoveryProductionSchedule(env.DB, targetRow.venue_id, productionSchedule);
 
   const batchDurationMs = Date.now() - batchStartedAt;
   const batchCompletedAtIso = new Date().toISOString();
