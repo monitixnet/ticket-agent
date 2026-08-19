@@ -149,6 +149,12 @@ If the flag is not enabled, the worker will continue monitoring and validating i
 
 This is the recommended default while the system is being tested in production-like conditions.
 
+### Skybox venue mapping (required before listing)
+
+Discovery uses the internal venue and hall pair `segerstrom_center` / `Segerstrom Hall`. Before any Skybox listing workflow is enabled, use Skybox's venue-name automation to search for **Segerstrom Hall**, manually confirm the returned venue once, and save its stable Skybox venue ID against that exact internal pair.
+
+Use the saved Skybox venue ID for all later listing actions. Do not perform a fuzzy venue-name search for every listing, and fail closed if the saved mapping is missing or ambiguous. This mapping is a setup record only; it does not enable outbound listings.
+
 ## Current milestone requirement
 
 The current milestone explicitly requires a real venue adapter contract for each active venue before we consider the validation loop production-ready.
