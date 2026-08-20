@@ -257,6 +257,36 @@ function debugLogAndNotify(env, ctx, message, level = 'info') {
  * @param {string} message - The message to send.
  * @param {string} channel - The notification channel ('debug' or 'critical').
  */
+export function buildNotificationRequest(url, message) {
+  const endpoint = new URL(url);
+  const isTelegramSendMessage = endpoint.hostname === 'api.telegram.org'
+    && /\/bot[^/]+\/sendMessage$/i.test(endpoint.pathname);
+  if (isTelegramSendMessage) {
+    const chatId = endpoint.searchParams.get('chat_id');
+    if (!chatId) throw new Error('Telegram notification URL must include chat_id.');
+    endpoint.searchParams.delete('chat_id');
+    endpoint.searchParams.delete('text');
+    return {
+      url: endpoint.toString(),
+      body: JSON.stringify({ chat_id: chatId, text: message })
+    };
+  }
+  return {
+    url,
+    body: JSON.stringify({ content: `\`\`\`\n${message}\n\`\`\`` })
+  };
+}
+
+async function postNotification(url, message) {
+  const request = buildNotificationRequest(url, message);
+  const response = await fetch(request.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: request.body
+  });
+  if (!response.ok) throw new Error(`notification endpoint returned HTTP ${response.status}`);
+}
+
 function sendTelegramNotification(env, ctx, message, channel = 'debug') {
   const url = channel === 'critical'
     ? env.CRITICAL_NOTIFICATION_OUTBOUND_URL
@@ -264,11 +294,8 @@ function sendTelegramNotification(env, ctx, message, channel = 'debug') {
 
   // Only send if an appropriate URL is configured.
   if (url) {
-    const promise = fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: `\`\`\`\n${message}\n\`\`\`` }) // Format as a code block for readability
-    }).catch(err => console.error(`[TELEGRAM NOTIFY FAILED] ${err.message}`));
+    const promise = postNotification(url, message)
+      .catch(err => console.error(`[TELEGRAM NOTIFY FAILED] ${err.message}`));
     // Use waitUntil to allow the fetch to complete in the background.
     ctx?.waitUntil(promise);
   }
@@ -280,28 +307,47 @@ async function deliverCriticalNotification(env, message) {
   // remain durable in D1 if neither endpoint exists.
   const url = env.CRITICAL_NOTIFICATION_OUTBOUND_URL || env.NOTIFICATION_OUTBOUND_URL;
   if (!url) throw new Error('No critical or default notification endpoint is configured');
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: `\`\`\`\n${message}\n\`\`\`` })
-  });
-  if (!response.ok) throw new Error(`notification endpoint returned HTTP ${response.status}`);
+  await postNotification(url, message);
 }
 
-function buildDropAlertMessage(payload = {}) {
+function formatCurrency(cents) {
+  return Number.isFinite(Number(cents)) ? `$${(Number(cents) / 100).toFixed(2)}` : 'price unavailable';
+}
+
+export function buildDropAlertMessage(payload = {}) {
   const priceRule = Number.isFinite(Number(payload.maxPriceCents))
     ? `Price rule: $${(Number(payload.maxPriceCents) / 100).toFixed(2)} or less`
     : 'Price rule: any available price';
+  const priceRange = payload.lowestQualifyingPriceCents == null
+    ? 'No qualifying price found'
+    : `${formatCurrency(payload.lowestQualifyingPriceCents)}–${formatCurrency(payload.highestQualifyingPriceCents)}`;
+  const sectionSummary = (payload.sectionSummaries || [])
+    .slice(0, 4)
+    .map(section => `${section.section}: ${section.availableSeats}`)
+    .join(' | ') || 'No section summary available';
+  const seatSamples = (payload.eligibleSeatSamples || [])
+    .slice(0, 4)
+    .map(seat => `${seat.section}, Row ${seat.row}, Seat ${seat.seat} (${formatCurrency(seat.priceCents)})`)
+    .join('\n') || 'No individual eligible-seat sample available';
+  const candidateSamples = (payload.eligibleCandidateBlocks || [])
+    .slice(0, 3)
+    .map(candidate => `Qty ${candidate.targetQuantity}: ${candidate.section}, Row ${candidate.row}, Seats ${candidate.startSeat}–${candidate.endSeat} (${formatCurrency(candidate.priceCents)})`)
+    .join('\n');
   return [
     '🚨 TICKET DROP DETECTED',
     `Venue: ${payload.venueName}`,
+    `Hall: ${payload.venueHall || 'unresolved'}`,
     `Show: ${payload.showName}`,
     `Performance: ${payload.showtime}`,
-    `Available seats detected: ${payload.availableItemCount}`,
+    `Event ID: ${payload.eventId}`,
+    `Eligible seats detected: ${payload.availableItemCount} (${priceRange})`,
     priceRule,
+    `Sections: ${sectionSummary}`,
+    `Eligible-seat sample:\n${seatSamples}`,
+    ...(candidateSamples ? [`Buffered candidate blocks:\n${candidateSamples}`] : []),
     `Observed: ${payload.observedAt}`,
     `Buy: ${payload.eventUrl || 'direct URL unavailable'}`,
-    'Rule: previously confirmed sold out → availability now detected.'
+    'Possible opportunity only—verify live availability and resale economics before buying.'
   ].join('\n');
 }
 
@@ -593,15 +639,30 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             ? Number(targetRow.drop_watch_max_price_cents)
             : null;
           const qualifyingInventory = filterInventoryForDropPriceRule(inventory, maxPriceCents);
+          const qualifyingPrices = qualifyingInventory
+            .map(item => Number(item.priceCents))
+            .filter(Number.isFinite);
+          const eligibleCandidateBlocks = candidates.filter(candidate => maxPriceCents == null
+            || (Number.isFinite(Number(candidate.priceCents)) && Number(candidate.priceCents) <= maxPriceCents));
           const dropPayload = {
             eventId: targetRow.event_id,
             venueName: targetRow.venue_name,
+            venueHall: targetRow.venue_hall,
             showName: targetRow.show_name,
             showtime: targetRow.showtime,
             eventUrl: targetRow.event_url,
             availableItemCount: qualifyingInventory.length,
             observedAvailableItemCount: inventory.length,
             maxPriceCents,
+            lowestQualifyingPriceCents: qualifyingPrices.length ? Math.min(...qualifyingPrices) : null,
+            highestQualifyingPriceCents: qualifyingPrices.length ? Math.max(...qualifyingPrices) : null,
+            sectionSummaries: summarizeAvailableSeatsBySection(qualifyingInventory),
+            eligibleSeatSamples: qualifyingInventory
+              .slice()
+              .sort((left, right) => Number(left.priceCents) - Number(right.priceCents))
+              .slice(0, 4)
+              .map(item => ({ section: item.section, row: item.row, seat: item.seat, priceCents: item.priceCents })),
+            eligibleCandidateBlocks: eligibleCandidateBlocks.slice(0, 3),
             observedAt: timestampIsoString
           };
           dropObservation = await recordInventoryAvailabilityObservation(env.DB, {

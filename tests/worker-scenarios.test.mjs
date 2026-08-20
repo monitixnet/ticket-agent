@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   buildHumanReviewNotification,
+  buildNotificationRequest,
+  buildDropAlertMessage,
   filterInventoryForDropPriceRule,
   default as worker,
 } from '../index.js';
@@ -238,6 +240,33 @@ const run = async () => {
       { priceCents: null }
     ], 17000);
     assert.deepEqual(qualifying.map(item => item.priceCents), [16999, 17000]);
+  });
+
+  test('Telegram notifications use Telegram chat_id and text fields', () => {
+    const request = buildNotificationRequest(
+      'https://api.telegram.org/botREDACTED/sendMessage?chat_id=-123&text=',
+      'Drop detected'
+    );
+    assert.equal(request.url, 'https://api.telegram.org/botREDACTED/sendMessage');
+    assert.deepEqual(JSON.parse(request.body), { chat_id: '-123', text: 'Drop detected' });
+  });
+
+  test('drop alerts contain decision-ready venue, ticket, pricing, and seat details', () => {
+    const message = buildDropAlertMessage({
+      venueName: 'Segerstrom Center for the Arts', venueHall: 'Segerstrom Hall',
+      showName: 'Phantom of the Opera', showtime: '2026-08-20 19:30:00', eventId: '30586',
+      eventUrl: 'https://seatme.scfta.org/single?id=30586', availableItemCount: 8,
+      maxPriceCents: 17000, lowestQualifyingPriceCents: 12500, highestQualifyingPriceCents: 17000,
+      sectionSummaries: [{ section: 'Orchestra', availableSeats: 8 }],
+      eligibleSeatSamples: [{ section: 'Orchestra', row: 'D', seat: '12', priceCents: 12500 }],
+      eligibleCandidateBlocks: [{ targetQuantity: 2, section: 'Orchestra', row: 'D', startSeat: '12', endSeat: '13', priceCents: 12500 }],
+      observedAt: '2026-08-20T12:00:00.000Z'
+    });
+    assert.match(message, /Hall: Segerstrom Hall/);
+    assert.match(message, /Event ID: 30586/);
+    assert.match(message, /\$125\.00–\$170\.00/);
+    assert.match(message, /Row D, Seat 12/);
+    assert.match(message, /Buy: https:\/\/seatme\.scfta\.org\/single\?id=30586/);
   });
 
   test('listing watcher is selected at minute 17', () => {
