@@ -10,3 +10,11 @@ export const SCAN_JITTER_CONFIG = {
   listingWatch: { minMs: 4000, maxMs: 16000 },
   inventoryScan: { minMs: 15000, maxMs: 45000 },
 };
+
+// D1 selects the venue-level value. These are guardrails, not venue policy:
+// an absent value remains bounded and a malformed value cannot create an
+// unbounded Algolia discovery crawl.
+export const DISCOVERY_PAGE_LIMITS = {
+  defaultMaxPages: 30,
+  absoluteMaxPages: 100,
+};

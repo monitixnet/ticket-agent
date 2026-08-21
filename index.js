@@ -442,19 +442,12 @@ async function executeApiFetch(url, options = {}) {
 
 async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions = {}) {
   const method = fetchOptions.method || 'GET';
-  let providerPool = ['native']; // Default to native fetch for low-security targets
-
-  if (targetRow?.security_tier === 'high') {
-    // For high-security targets, intelligently select the provider type.
-    if (method === 'POST' || fetchOptions.apiRequest === true) {
-      // API calls use a dedicated, configurable provider pool.
-      // Defaults to the API proxy with a native fetch fallback.
-      providerPool = (env.API_FETCH_PROVIDER_POOL || 'zenrows_api,native').split(',').map(p => p.trim()).filter(Boolean);
-    } else {
-      // Web page scrapes use the browser rendering provider.
-      providerPool = (env.FETCH_PROVIDER_POOL || 'zenrows_browser,native').split(',').map(p => p.trim()).filter(Boolean);
-    }
-  }
+  // Native is the fail-closed default. Venue-specific approved pools are
+  // supplied from the D1 adapter; missing deployment variables never revive a
+  // paid proxy or browser provider.
+  const configuredPool = fetchOptions.providerPool;
+  const providerPool = (Array.isArray(configuredPool) ? configuredPool : String(configuredPool || 'native').split(','))
+    .map(provider => String(provider).trim()).filter(Boolean);
 
   let lastResult = null;
 
@@ -600,11 +593,12 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
 
     const secureFetchForScan = (fetchEnv, url, row, fetchOptions = {}) => executeSecureFetch(fetchEnv, url, row, {
       ...fetchOptions,
+      providerPool: fetchOptions.apiRequest ? adapter.apiFetchProviderPool : adapter.fetchProviderPool,
       requestBudget: fetchOptions.requestBudget || options.requestBudget,
       // Endpoint rows are intentionally opt-in diagnostics. Redirect handling
       // itself is always enabled, but normal production scans do not write one
       // D1 row per HTTP response unless debug telemetry is explicitly enabled.
-      onFetchResult: env.ENABLE_DEBUG_TELEMETRY === 'true' && !isDiscovery && fetchOptions.inventoryEndpoint
+      onFetchResult: adapter.debugTelemetryEnabled && !isDiscovery && fetchOptions.inventoryEndpoint
         ? async (result, durationMs) => {
           const isRedirect = Number(result?.status) >= 300 && Number(result?.status) < 400;
           const contentType = result?.contentType || null;

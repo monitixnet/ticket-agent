@@ -8,33 +8,42 @@ This project is a Cloudflare Worker for monitoring event inventory and validatin
 
 Strategy names are intentionally allowlisted in code; D1 selects an approved strategy but cannot execute arbitrary code. Secrets are never stored in D1: `credential_refs_json` contains only a Worker-secret name, such as `ALGOLIA_SEGERSTROM_API_KEY`.
 
+### Configuration boundaries
+
+Operational controls belong in `venue_runtime_configs.config_json` in D1: adapter endpoint templates, fetch-provider policy, discovery limits, batch sizes, monitoring hours, inventory rules, listing gates, and diagnostic flags. This makes D1 the auditable control plane and avoids committing venue policy to the Worker deployment. Some legacy environment-variable reads are being migrated into this control plane; do not rely on a missing D1 value falling back to a deployment variable.
+
+Each venue Worker keeps only its bootstrap identity and D1 binding in `wrangler.jsonc`:
+
+```jsonc
+"vars": {
+  "WORKER_VENUE_ID": "segerstrom_center"
+},
+"d1_databases": [{
+  "binding": "DB",
+  "database_name": "ticket-agent-db",
+  "database_id": "...",
+  "migrations_dir": "migrations"
+}]
+```
+
+`WORKER_VENUE_ID` is intentionally outside D1. It scopes one deployed Worker to one tenant/venue, so a configuration error cannot cause it to operate across all active venues. Keep secret values—API keys, webhook credentials, and notification URLs—in Cloudflare Worker Secrets, never in D1 or Git.
+
 Discovery persists every production's latest sale outcome in D1, including the overall status, sale-start timestamp, and sub-item status counts. Past, not-on-sale, and free-no-ticket productions are recorded as exclusions and removed from recurring discovery. On-sale productions are refreshed every six hours; future-sale productions are rechecked at their advertised sale start; sold-out productions are retained and rechecked hourly until they are linked into the separate drop-watch lane.
 
 ## Local setup
 
-Create a `.dev.vars` file at the root of this project folder and set the required environment variables for local development. The Worker uses a Cloudflare D1 database configured in `wrangler.jsonc`.
+Create a `.dev.vars` file at the root of this project folder and set only the required secrets and bootstrap venue identity for local development. The Worker uses a Cloudflare D1 database configured in `wrangler.jsonc`; operational policy is progressively loaded from D1.
 
 ```bash
 # Example .dev.vars
-FETCH_PROVIDER_POOL="native"
-API_FETCH_PROVIDER_POOL="native"
-DISCOVERY_MAX_PAGES="100"
 WORKER_VENUE_ID="segerstrom_center"
-DISCOVERY_BATCH_SIZE="30"
-DISCOVERY_SUMMARY_NOTIFICATIONS="false"
-ENABLE_DEBUG_TELEMETRY="false"
 ALGOLIA_SEGERSTROM_API_KEY="your_segerstrom_algolia_search_key"
-SCRAPEFLY_API_KEY="your_scrapfly_api_key"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 CRITICAL_NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 WEBHOOK_SHARED_SECRET="your_shared_secret_here"
-ALLOW_SKYBOX_LISTING="false"
-ENABLE_AUTOMATED_APPROVAL="false"
 ```
 
-`DISCOVERY_SUMMARY_NOTIFICATIONS` is optional and only governs the queue-completion discovery summary sent through the outbound notification channel. Leave it off during normal monitoring unless you want a Telegram summary after each discovery cycle. It is designed to be an explicit operational opt-in to avoid noisy alerts during routine scans.
-
-`ENABLE_DEBUG_TELEMETRY` is optional and defaults to `false`. When set to `true`, inventory requests record response metadata in `inventory_endpoint_telemetry`: event/job, endpoint type, provider, HTTP status, content type, redirect indicator, outcome, and duration. It never stores cookies, request headers, URLs with query data, or response bodies. Rows are retained for 30 days. This flag is independent of Telegram debug notifications.
+When D1 debug telemetry is enabled for a venue, inventory requests record response metadata in `inventory_endpoint_telemetry`: event/job, endpoint type, provider, HTTP status, content type, redirect indicator, outcome, and duration. It never stores cookies, request headers, URLs with query data, or response bodies. Rows are retained for 30 days. This diagnostic control is independent of Telegram debug notifications.
 
 `WEBHOOK_SHARED_SECRET` authenticates callers of the endpoints below. Requests must include it as an `X-Webhook-Secret` header; requests without a matching header are rejected with `401`. Generate a real value yourself — it's just a random secret, not tied to any external system — for example: `openssl rand -hex 32`. Whoever calls `/webhook/validate` or `/logs/recent` needs to be given that same value to send back as the header. Today that's limited to your own tooling and local testing, since there is no live Skybox integration yet (see [Hard boundaries](#hard-boundaries)).
 
@@ -44,6 +53,40 @@ Then initialize local D1 using the versioned migrations and seed file:
 npx wrangler d1 migrations apply ticket-agent-db --local
 npx wrangler d1 execute ticket-agent-db --local --file=database/seed.sql
 ```
+
+### Inspect venue runtime configuration
+
+Venue policy is stored in D1, not in source code. To inspect Segerstrom's active runtime configuration locally:
+
+```bash
+npx wrangler d1 execute ticket-agent-db --local --command "
+SELECT
+  c.venue_id,
+  c.status,
+  json_extract(c.config_json, '$.apiFetchProviderPool') AS api_fetch_provider_pool,
+  json_extract(c.config_json, '$.fetchProviderPool') AS fetch_provider_pool,
+  json_extract(c.config_json, '$.discoveryMaxPages') AS discovery_max_pages,
+  json_extract(c.config_json, '$.discoveryBatchSize') AS discovery_batch_size,
+  json_extract(c.config_json, '$.inventoryBatchSize') AS inventory_batch_size,
+  json_extract(c.config_json, '$.inventoryExternalRequestBudget') AS inventory_request_budget,
+  json_extract(c.config_json, '$.debugTelemetryEnabled') AS debug_telemetry_enabled,
+  json_extract(c.config_json, '$.discoveryAllowedHalls') AS discovery_allowed_halls
+FROM venue_runtime_configs c
+WHERE c.venue_id = 'segerstrom_center';
+"
+```
+
+Use the same command with `--remote` to inspect production. To view the complete non-secret configuration JSON, run:
+
+```bash
+npx wrangler d1 execute ticket-agent-db --remote --command "
+SELECT venue_id, status, config_json
+FROM venue_runtime_configs
+WHERE venue_id = 'segerstrom_center';
+"
+```
+
+`credential_refs_json` may be inspected to see secret *names*, but never contains secret values.
 
 ### Reset local discovery progress
 

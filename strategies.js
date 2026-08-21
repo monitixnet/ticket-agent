@@ -2,6 +2,7 @@ import { VENUE_PARSERS } from './venue-rules.js';
 import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, markDiscoveredSoldOutEvents, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 import { isMonitoringWindowActive } from './venue-logic.js';
+import { DISCOVERY_PAGE_LIMITS } from './global-config.js';
 
 const DISCOVERY_OUTCOMES = ['on_sale', 'sold_out', 'future_sale', 'past', 'not_on_sale', 'free_no_tickets', 'settings_unavailable', 'unknown', 'error'];
 const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
@@ -441,7 +442,10 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     const { algoliaAppId, algoliaApiKey, algoliaIndexName } = adapter;
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
     const headers = { 'Content-Type': 'application/json', 'X-Algolia-Application-Id': algoliaAppId, 'X-Algolia-API-Key': algoliaApiKey };
-    const maxPages = Math.max(1, Math.min(Number(env.DISCOVERY_MAX_PAGES) || 100, 100));
+    const maxPages = Math.max(1, Math.min(
+      Number(adapter.discoveryMaxPages) || DISCOVERY_PAGE_LIMITS.defaultMaxPages,
+      DISCOVERY_PAGE_LIMITS.absoluteMaxPages
+    ));
     const catalogProductions = [];
     let page = 0;
     let totalPages = 1;

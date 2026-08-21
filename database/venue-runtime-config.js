@@ -1,3 +1,5 @@
+import { DISCOVERY_PAGE_LIMITS } from '../global-config.js';
+
 const SECRET_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 
 function parseJson(value, fallback = {}) {
@@ -44,6 +46,8 @@ function buildAdapter(row, env) {
   const inventoryTargetQuantities = Array.isArray(config.inventoryTargetQuantities)
     ? [...new Set(config.inventoryTargetQuantities.map(Number).filter(value => Number.isInteger(value) && value >= 1 && value <= 10))]
     : [2, 6];
+  const providerPool = value => (Array.isArray(value) ? value : String(value || 'native').split(','))
+    .map(provider => String(provider).trim()).filter(Boolean);
 
   return {
     adapter: {
@@ -69,6 +73,13 @@ function buildAdapter(row, env) {
       dropWatchBatchSize,
       automaticSoldOutIntervalMinutes,
       inventoryTargetQuantities: inventoryTargetQuantities.length ? inventoryTargetQuantities : [2, 6]
+      ,apiFetchProviderPool: providerPool(config.apiFetchProviderPool)
+      ,fetchProviderPool: providerPool(config.fetchProviderPool)
+      ,discoveryMaxPages: Math.max(1, Math.min(
+        Number(config.discoveryMaxPages) || DISCOVERY_PAGE_LIMITS.defaultMaxPages,
+        DISCOVERY_PAGE_LIMITS.absoluteMaxPages
+      ))
+      ,debugTelemetryEnabled: config.debugTelemetryEnabled === true || config.debugTelemetryEnabled === 1
     },
     errors: []
   };
