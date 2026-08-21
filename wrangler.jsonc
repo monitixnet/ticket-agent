@@ -4,14 +4,6 @@
 	"main": "index.js",
 	"compatibility_date": "2026-07-30",
 	"vars": {
-		"ALLOW_SKYBOX_LISTING": "false",
-		"API_FETCH_PROVIDER_POOL": "native",
-		"DISCOVERY_MAX_PAGES": "30",
-		"ENABLE_AUTOMATED_APPROVAL": "false",
-		"ENABLE_DEBUG_NOTIFICATIONS": "true",
-		"ENABLE_DEBUG_TELEMETRY": "true",
-		"FETCH_PROVIDER_POOL": "native",
-		"SKYBOX_API_GATEWAY_URL": "https://skybox.com",
 		"WORKER_VENUE_ID": "segerstrom_center"
 	},
 	"triggers": {
