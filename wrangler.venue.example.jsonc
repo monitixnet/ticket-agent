@@ -9,6 +9,7 @@
     "DISCOVERY_MAX_PAGES": "30",
     "ENABLE_AUTOMATED_APPROVAL": "false",
     "ENABLE_DEBUG_NOTIFICATIONS": "false",
+    "ENABLE_DEBUG_TELEMETRY": "false",
     "FETCH_PROVIDER_POOL": "native",
     "WORKER_VENUE_ID": "venue_slug"
   },

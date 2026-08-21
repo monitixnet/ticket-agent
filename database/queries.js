@@ -22,6 +22,27 @@ export async function getRecentWorkerLogs(env, limit = 50) {
   return (result && result.results) ? result.results : [];
 }
 
+// Endpoint telemetry intentionally records response metadata only: no request
+// headers, cookies, URLs with query data, or response bodies.
+export async function recordInventoryEndpointTelemetry(db, telemetry = {}) {
+  if (!db || !telemetry.id || !telemetry.eventId || !telemetry.venueId || !telemetry.endpointType) return;
+  try {
+    await db.prepare(`INSERT INTO inventory_endpoint_telemetry (
+      id, event_id, venue_id, inventory_job_id, endpoint_type, provider,
+      http_status, content_type, redirect_detected, outcome, duration_ms, observed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(
+        telemetry.id, telemetry.eventId, telemetry.venueId, telemetry.inventoryJobId || null,
+        telemetry.endpointType, telemetry.provider || 'unknown', Number(telemetry.httpStatus) || 0,
+        telemetry.contentType || null, telemetry.redirectDetected ? 1 : 0,
+        telemetry.outcome || 'unknown', Math.max(0, Number(telemetry.durationMs) || 0),
+        telemetry.observedAt || new Date().toISOString()
+      ).run();
+  } catch (err) {
+    console.error('[DB] Inventory endpoint telemetry persist failed:', err?.message || err);
+  }
+}
+
 // Discovery must remain successful even if this optional operational telemetry
 // cannot be written, so persistence failures are contained here.
 export async function recordDiscoveryBatchMetric(db, metric) {
@@ -444,6 +465,7 @@ export async function cleanupOldWorkerLogs(db) {
   console.log('[DB] Running cleanup job for old worker logs...');
   // Purge logs older than 7 days to keep the database size manageable.
   const result = await db.prepare("DELETE FROM worker_logs WHERE timestamp < datetime('now', '-7 days')").run();
+  await db.prepare("DELETE FROM inventory_endpoint_telemetry WHERE observed_at < datetime('now', '-30 days')").run();
   const changed = result.changes ?? 0;
   if (changed > 0) {
     console.log(`[DB] Purged ${changed} old log(s) from the database.`);

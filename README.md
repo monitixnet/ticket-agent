@@ -22,6 +22,7 @@ DISCOVERY_MAX_PAGES="100"
 WORKER_VENUE_ID="segerstrom_center"
 DISCOVERY_BATCH_SIZE="30"
 DISCOVERY_SUMMARY_NOTIFICATIONS="false"
+ENABLE_DEBUG_TELEMETRY="false"
 ALGOLIA_SEGERSTROM_API_KEY="your_segerstrom_algolia_search_key"
 SCRAPEFLY_API_KEY="your_scrapfly_api_key"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
@@ -32,6 +33,8 @@ ENABLE_AUTOMATED_APPROVAL="false"
 ```
 
 `DISCOVERY_SUMMARY_NOTIFICATIONS` is optional and only governs the queue-completion discovery summary sent through the outbound notification channel. Leave it off during normal monitoring unless you want a Telegram summary after each discovery cycle. It is designed to be an explicit operational opt-in to avoid noisy alerts during routine scans.
+
+`ENABLE_DEBUG_TELEMETRY` is optional and defaults to `false`. When set to `true`, inventory requests record response metadata in `inventory_endpoint_telemetry`: event/job, endpoint type, provider, HTTP status, content type, redirect indicator, outcome, and duration. It never stores cookies, request headers, URLs with query data, or response bodies. Rows are retained for 30 days. This flag is independent of Telegram debug notifications.
 
 `WEBHOOK_SHARED_SECRET` authenticates callers of the endpoints below. Requests must include it as an `X-Webhook-Secret` header; requests without a matching header are rejected with `401`. Generate a real value yourself — it's just a random secret, not tied to any external system — for example: `openssl rand -hex 32`. Whoever calls `/webhook/validate` or `/logs/recent` needs to be given that same value to send back as the header. Today that's limited to your own tooling and local testing, since there is no live Skybox integration yet (see [Hard boundaries](#hard-boundaries)).
 

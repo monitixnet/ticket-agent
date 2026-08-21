@@ -555,9 +555,11 @@ const run = async () => {
     };
 
     const mockApiResponses = {
-      'https://seatme.scfta.org/api/settings/performance/30589': { facilitySettings: { sectionGroupings: [{ sectionGroupId: '1', description: 'Orchestra' }] } },
       'https://seatme.scfta.org/api/pricing/performance/30589': [{ zoneId: 9050, prices: [{ price: 206.78 }] }],
-      'https://seatme.scfta.org/api/sectionAvailability/performance/30589': [{ sectionGroupId: '1', sectionGroupName: 'Orchestra' }],
+      'https://seatme.scfta.org/api/sectionAvailability/performance/30589': [
+        { sectionGroupId: '1', sectionGroupName: 'Orchestra', totalAvailableSeats: 1 },
+        { sectionGroupId: '2', sectionGroupName: 'Balcony', totalAvailableSeats: 0 }
+      ],
       'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId=1&performanceId=30589': {
         available: { 'S_1-M-3': { no: 7027, sec: 1, row: 'M', num: '3', zone: 9050 } }
       },
@@ -580,8 +582,86 @@ const run = async () => {
     assert.equal(seat.priceLevel, 9050);
     assert.equal(seat.priceCents, 20678);
     assert.equal(seat.available, true);
-    assert.equal(apiRequests.length, 4);
+    assert.deepEqual(apiRequests.map(request => request.url), [
+      'https://seatme.scfta.org/api/sectionAvailability/performance/30589',
+      'https://seatme.scfta.org/api/pricing/performance/30589',
+      'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId=1&performanceId=30589'
+    ]);
     assert.equal(apiRequests.every(({ options }) => options.apiRequest === true), true);
+    assert.equal(apiRequests.every(({ options }) => options.redirect === 'manual'), true);
+    assert.deepEqual(apiRequests.map(({ options }) => options.inventoryEndpoint), [
+      'section_availability', 'pricing', 'seat_info'
+    ]);
+  });
+
+  test('Segerstrom drill-down reports a SeatMe redirect without parsing it as inventory JSON', async () => {
+    const targetRow = { venue_id: 'segerstrom_center', event_url: 'https://seatme.scfta.org/single?id=30598' };
+    const adapter = {
+      performanceIdParam: 'id',
+      inventoryApiUrlPattern: 'https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}'
+    };
+    await assert.rejects(
+      segerstromDrillDownStrategy(targetRow, '', {}, {}, async () => ({
+        status: 303,
+        text: JSON.stringify({ redirectMask: 'https://www.scfta.org/cart/updatecart' })
+      }), () => {}, adapter),
+      /section_availability returned redirect HTTP 303/
+    );
+  });
+
+  test('Segerstrom drill-down records a sold-out event from availability alone', async () => {
+    const targetRow = { venue_id: 'segerstrom_center', event_url: 'https://seatme.scfta.org/single?id=30589' };
+    const adapter = {
+      performanceIdParam: 'id',
+      settingsApiUrlPattern: 'https://seatme.scfta.org/api/settings/performance/{performanceId}',
+      priceApiUrlPattern: 'https://seatme.scfta.org/api/pricing/performance/{performanceId}',
+      inventoryApiUrlPattern: 'https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}',
+      seatInfoApiUrlPattern: 'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId={groupId}&performanceId={performanceId}'
+    };
+    const apiRequests = [];
+    const fetchAvailabilityOnly = async (_env, url) => {
+      apiRequests.push(url);
+      return { text: JSON.stringify([{ sectionGroupId: '1', sectionGroupName: 'Orchestra', totalAvailableSeats: 0 }]), status: 200 };
+    };
+
+    const result = await segerstromDrillDownStrategy(targetRow, '', {}, {}, fetchAvailabilityOnly, () => {}, adapter);
+
+    assert.deepEqual(result, []);
+    assert.deepEqual(apiRequests, ['https://seatme.scfta.org/api/sectionAvailability/performance/30589']);
+  });
+
+  test('Segerstrom drill-down uses settings only when availability omits a section name', async () => {
+    const targetRow = { venue_id: 'segerstrom_center', event_url: 'https://seatme.scfta.org/single?id=30589' };
+    const adapter = {
+      performanceIdParam: 'id',
+      settingsApiUrlPattern: 'https://seatme.scfta.org/api/settings/performance/{performanceId}',
+      priceApiUrlPattern: 'https://seatme.scfta.org/api/pricing/performance/{performanceId}',
+      inventoryApiUrlPattern: 'https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}',
+      seatInfoApiUrlPattern: 'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId={groupId}&performanceId={performanceId}'
+    };
+    const responses = {
+      'https://seatme.scfta.org/api/sectionAvailability/performance/30589': [{ sectionGroupId: '1', totalAvailableSeats: 1 }],
+      'https://seatme.scfta.org/api/settings/performance/30589': { facilitySettings: { sectionGroupings: [{ sectionGroupId: '1', description: 'Orchestra' }] } },
+      'https://seatme.scfta.org/api/pricing/performance/30589': [{ zoneId: 9050, prices: [{ price: 206.78 }] }],
+      'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId=1&performanceId=30589': {
+        available: { 'S_1-M-3': { no: 7027, sec: 1, row: 'M', num: '3', zone: 9050 } }
+      }
+    };
+    const apiRequests = [];
+    const fakeFetch = async (_env, url) => {
+      apiRequests.push(url);
+      return { text: JSON.stringify(responses[url] || {}), status: 200 };
+    };
+
+    const result = await segerstromDrillDownStrategy(targetRow, '', {}, {}, fakeFetch, () => {}, adapter);
+
+    assert.equal(result[0].section, 'Orchestra');
+    assert.deepEqual(apiRequests, [
+      'https://seatme.scfta.org/api/sectionAvailability/performance/30589',
+      'https://seatme.scfta.org/api/settings/performance/30589',
+      'https://seatme.scfta.org/api/pricing/performance/30589',
+      'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId=1&performanceId=30589'
+    ]);
   });
 
   test('discovery persistence uses the schema column names and deterministic show IDs', async () => {

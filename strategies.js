@@ -237,7 +237,8 @@ export async function singleStepParseStrategy(targetRow, htmlBody, env, ctx, exe
 /**
  * A multi-step inventory-checking strategy for Segerstrom Center.
  * This function is designed for an "Inventory Job" that targets a specific event.
- * It performs a three-step API "drill-down" to get full seat and price information.
+ * It starts with section availability, then obtains seat and price detail only
+ * when availability proves that detail is needed.
  */
 export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, _executeApiFetch) {
   const performanceId = new URL(targetRow.event_url).searchParams.get(adapter.performanceIdParam || 'id');
@@ -248,50 +249,84 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
   }
 
   try {
-    // Step 1: Get performance settings, which includes the mapping of sectionGroupId to section names.
-    const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', performanceId);
-    console.log(`[PARSER] Fetching performance settings from: ${settingsUrl}`); // Keep logging for visibility
-    const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true });
-    const settingsData = JSON.parse(settingsPayload.text || '{}');
-    const sectionNameMap = (settingsData?.facilitySettings?.sectionGroupings || []).reduce((map, group) => {
-      map[group.sectionGroupId] = group.description;
-      return map;
-    }, {});
-
-    // Step 2: Get pricing information for all zones.
-    const priceApiUrl = adapter.priceApiUrlPattern?.replace('{performanceId}', performanceId);
-    console.log(`[PARSER] Fetching zone pricing from: ${priceApiUrl}`); // Keep logging for visibility
-    const pricePayload = await executeSecureFetch(env, priceApiUrl, targetRow, { method: 'GET', apiRequest: true });
-    const priceData = JSON.parse(pricePayload.text || '[]');
-    const zonePriceMap = priceData.reduce((map, zone) => {
-      if (zone.prices?.[0]) {
-        map[zone.zoneId] = zone.prices[0].price;
+    const parseInventoryApiPayload = (payload, fallback, endpointType) => {
+      const status = Number(payload?.status);
+      if (status >= 300 && status < 400) {
+        throw new Error(`${endpointType} returned redirect HTTP ${status}.`);
       }
-      return map;
-    }, {});
-
-    // Step 3: Get section availability.
+      if (!Number.isFinite(status) || status < 200 || status >= 300) {
+        throw new Error(`${endpointType} returned HTTP ${Number.isFinite(status) ? status : 'unknown'}.`);
+      }
+      try {
+        return JSON.parse(payload?.text || fallback);
+      } catch {
+        throw new Error(`${endpointType} returned non-JSON content (HTTP ${status}).`);
+      }
+    };
+    // Step 1: Availability is the cheapest authoritative signal. A sold-out
+    // performance needs no price, settings, or seat-map requests.
     const sectionAvailabilityUrl = adapter.inventoryApiUrlPattern?.replace('{performanceId}', performanceId);
     console.log(`[PARSER] Fetching section availability from: ${sectionAvailabilityUrl}`); // Keep logging for visibility
-    const sectionPayload = await executeSecureFetch(env, sectionAvailabilityUrl, targetRow, { method: 'GET', apiRequest: true });
-    const sectionGroups = JSON.parse(sectionPayload.text || '[]');
+    const sectionPayload = await executeSecureFetch(env, sectionAvailabilityUrl, targetRow, { method: 'GET', apiRequest: true, redirect: 'manual', inventoryEndpoint: 'section_availability' });
+    const sectionGroups = parseInventoryApiPayload(sectionPayload, '[]', 'section_availability');
+    if (!Array.isArray(sectionGroups)) throw new Error('section_availability returned an unexpected JSON shape.');
+    const activeSectionGroups = sectionGroups.filter(group => {
+      const total = Number(group?.totalAvailableSeats);
+      if (Number.isFinite(total)) return total > 0;
+      const summaries = Array.isArray(group?.sectionSeatSummaries) ? group.sectionSeatSummaries : [];
+      if (summaries.length) return summaries.some(summary => Number(summary?.availableCount) > 0);
+      // An unfamiliar payload must fail closed toward complete inventory, not
+      // silently classify a potentially available section as sold out.
+      return Boolean(group?.sectionGroupId);
+    });
+    if (!activeSectionGroups.length) {
+      console.log(`[PARSER] Performance ${performanceId} has no available sections; skipping detail endpoints.`);
+      return [];
+    }
+
+    // Section availability normally supplies the display name. Only use the
+    // settings endpoint as a fallback for malformed/incomplete availability
+    // payloads.
+    const sectionNameMap = {};
+    if (activeSectionGroups.some(group => !String(group?.sectionGroupName || '').trim())) {
+      const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', performanceId);
+      console.log(`[PARSER] Fetching performance settings fallback from: ${settingsUrl}`);
+      const settingsPayload = await executeSecureFetch(env, settingsUrl, targetRow, { method: 'GET', apiRequest: true, redirect: 'manual', inventoryEndpoint: 'settings' });
+      const settingsData = parseInventoryApiPayload(settingsPayload, '{}', 'settings');
+      for (const group of settingsData?.facilitySettings?.sectionGroupings || []) {
+        sectionNameMap[String(group.sectionGroupId)] = group.description;
+      }
+    }
+
+    // Price is needed only for available inventory and candidate evaluation.
+    const priceApiUrl = adapter.priceApiUrlPattern?.replace('{performanceId}', performanceId);
+    console.log(`[PARSER] Fetching zone pricing from: ${priceApiUrl}`); // Keep logging for visibility
+    const pricePayload = await executeSecureFetch(env, priceApiUrl, targetRow, { method: 'GET', apiRequest: true, redirect: 'manual', inventoryEndpoint: 'pricing' });
+    const priceData = parseInventoryApiPayload(pricePayload, '[]', 'pricing');
+    if (!Array.isArray(priceData)) throw new Error('pricing returned an unexpected JSON shape.');
+    const zonePriceMap = priceData.reduce((map, zone) => {
+      if (zone.prices?.[0]) map[zone.zoneId] = zone.prices[0].price;
+      return map;
+    }, {});
 
     const allSeatData = [];
 
     if (adapter.seatInfoApiUrlPattern) {
-      // Step 4: For each section group, get the detailed seat info in parallel.
-      const seatInfoPromises = sectionGroups.map(group => {
-        if (group.sectionGroupId) {
-          const seatInfoUrl = adapter.seatInfoApiUrlPattern?.replace('{performanceId}', performanceId)?.replace('{groupId}', group.sectionGroupId);
-          console.log(`[PARSER] Fetching detailed seat info from: ${seatInfoUrl}`); // Keep logging for visibility
-          return executeSecureFetch(env, seatInfoUrl, targetRow, { method: 'GET', apiRequest: true }).then(payload => ({ ...JSON.parse(payload.text || '{}'), sectionGroupName: sectionNameMap[group.sectionGroupId] || group.sectionGroupName }));
-        }
-        return Promise.resolve(null); // Return a resolved promise for groups without ID
-      });
-      allSeatData.push(...(await Promise.all(seatInfoPromises)).filter(Boolean));
+      // Fetch active groups sequentially. This avoids a per-event connection
+      // burst while retaining complete seat detail for every available section.
+      for (const group of activeSectionGroups) {
+        if (!group.sectionGroupId) continue;
+        const seatInfoUrl = adapter.seatInfoApiUrlPattern?.replace('{performanceId}', performanceId)?.replace('{groupId}', group.sectionGroupId);
+        console.log(`[PARSER] Fetching detailed seat info from: ${seatInfoUrl}`); // Keep logging for visibility
+        const payload = await executeSecureFetch(env, seatInfoUrl, targetRow, { method: 'GET', apiRequest: true, redirect: 'manual', inventoryEndpoint: 'seat_info' });
+        allSeatData.push({
+          ...parseInventoryApiPayload(payload, '{}', 'seat_info'),
+          sectionGroupName: sectionNameMap[String(group.sectionGroupId)] || group.sectionGroupName
+        });
+      }
     }
 
-    // Step 5: Pass the combined seat and price data to the final parser
+    // Pass the combined seat and price data to the final parser.
     const finalPayload = { seats: allSeatData, prices: zonePriceMap };
     const parser = VENUE_PARSERS[targetRow.venue_id];
     return parser(JSON.stringify(finalPayload), targetRow.venue_id)

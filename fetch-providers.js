@@ -12,9 +12,20 @@ async function nativeFetchProvider(_env, targetUrlString, _targetRow, fetchOptio
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       ...(fetchOptions.headers || {})
     },
-    body: fetchOptions.body
+    body: fetchOptions.body,
+    // Inventory APIs must expose SeatMe's redirect decision to the caller.
+    // Following a cart redirect turns a meaningful 303 into HTML and hides
+    // the real upstream outcome.
+    redirect: fetchOptions.redirect || 'follow'
   });
-  return { text: await res.text(), status: res.status, routedVia: 'nativeFetchProvider' };
+  return {
+    text: await res.text(),
+    status: res.status,
+    contentType: res.headers.get('content-type') || null,
+    redirectLocation: res.headers.get('location') || null,
+    redirected: res.redirected,
+    routedVia: 'nativeFetchProvider'
+  };
 }
 
 // ScrapFly preserves the upstream method, body, and request headers. That is

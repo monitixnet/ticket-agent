@@ -8,6 +8,7 @@ import {
   getUpcomingEventById,
   updateEventScanResult,
   persistInventoryCandidates,
+  recordInventoryEndpointTelemetry,
   getDueDropWatchEvents,
   recordInventoryAvailabilityObservation,
   getPendingInventoryDropAlerts,
@@ -466,7 +467,11 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
 
     try {
       consumeExternalRequestBudget(fetchOptions.requestBudget, `${providerName} ${method} ${targetUrlString}`);
+      const requestStartedAt = Date.now();
       const result = await provider(env, targetUrlString, targetRow, fetchOptions);
+      if (typeof fetchOptions.onFetchResult === 'function') {
+        await fetchOptions.onFetchResult(result, Date.now() - requestStartedAt);
+      }
       lastResult = result;
 
       // A proxy error must not prevent the configured fallback provider from
@@ -595,7 +600,27 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
 
     const secureFetchForScan = (fetchEnv, url, row, fetchOptions = {}) => executeSecureFetch(fetchEnv, url, row, {
       ...fetchOptions,
-      requestBudget: fetchOptions.requestBudget || options.requestBudget
+      requestBudget: fetchOptions.requestBudget || options.requestBudget,
+      // Endpoint rows are intentionally opt-in diagnostics. Redirect handling
+      // itself is always enabled, but normal production scans do not write one
+      // D1 row per HTTP response unless debug telemetry is explicitly enabled.
+      onFetchResult: env.ENABLE_DEBUG_TELEMETRY === 'true' && !isDiscovery && fetchOptions.inventoryEndpoint
+        ? async (result, durationMs) => {
+          const isRedirect = Number(result?.status) >= 300 && Number(result?.status) < 400;
+          const contentType = result?.contentType || null;
+          const isJsonContent = !contentType || /(?:application|text)\/json/i.test(contentType);
+          await recordInventoryEndpointTelemetry(env.DB, {
+            id: buildWorkerLogId(), eventId: targetRow.event_id, venueId: targetRow.venue_id,
+            inventoryJobId: options.inventoryJobId, endpointType: fetchOptions.inventoryEndpoint,
+            provider: result?.routedVia, httpStatus: result?.status, contentType,
+            redirectDetected: isRedirect,
+            outcome: isRedirect ? 'redirect'
+              : (!isJsonContent ? 'unexpected_content_type'
+                : (Number(result?.status) >= 200 && Number(result?.status) < 300 ? 'success' : 'http_error')),
+            durationMs
+          });
+        }
+        : fetchOptions.onFetchResult
     });
     const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, secureFetchForScan, trackWorkerLog, adapter, boundApiFetch);
     const scanDurationMs = Date.now() - scanStartedAtMs;
