@@ -6,10 +6,12 @@ import {
   buildNotificationRequest,
   buildDropAlertMessage,
   filterInventoryForDropPriceRule,
+  runScheduledCycle,
   default as worker,
 } from '../index.js';
 import {
   isMonitoringWindowActive,
+  formatVenueLocalTime,
   getScheduleModeForCronDate,
   inferVenueTimeZone,
   buildVenueAdapterSmokeReport,
@@ -44,6 +46,7 @@ import {
   getListingForValidation,
   upsertDiscoveredEvents,
   markDiscoveredSoldOutEvents,
+  getHallInventoryPolicy,
 } from '../database/queries.js';
 import { normalizeExternalId } from '../utils.js';
 import { getActiveVenueAdapters } from '../database/venue-runtime-config.js';
@@ -64,6 +67,10 @@ const run = async () => {
 
   test('business window is closed before 7:30 AM local venue time', () => {
     assert.equal(isMonitoringWindowActive(new Date('2026-08-03T06:00:00-07:00'), 'America/Los_Angeles'), false);
+  });
+
+  test('curfew audit time is rendered in the venue timezone, not UTC', () => {
+    assert.equal(formatVenueLocalTime(new Date('2026-08-03T14:05:00Z'), 'America/Los_Angeles'), '2026-08-03 07:05:00');
   });
 
   test('current sold-out performances are monitored even when a production also contains past performances', () => {
@@ -191,6 +198,14 @@ const run = async () => {
     }), false);
   });
 
+  test('hall inventory policy accepts SQLite JSON true represented as 1', async () => {
+    const fakeDb = {
+      prepare: () => ({ bind: () => ({ first: async () => ({ metadata_json: '{"inventory_enabled":1}' }) }) })
+    };
+    const policy = await getHallInventoryPolicy(fakeDb, 'segerstrom-hall');
+    assert.equal(policy.inventoryEnabled, true);
+  });
+
   test('external numeric IDs discard only a decimal-zero suffix', () => {
     assert.equal(normalizeExternalId('31946.0'), '31946');
     assert.equal(normalizeExternalId('00123'), '00123');
@@ -222,9 +237,46 @@ const run = async () => {
     assert.equal(inferVenueTimeZone('Segerstrom Center', 'CA', 'America/Los_Angeles'), 'America/Los_Angeles');
   });
 
-  test('inventory scan is selected at minute 9', () => {
-    const date = new Date(Date.UTC(2026, 7, 3, 0, 9, 0));
+  test('inventory scan is selected at minute 7', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 7, 0));
     assert.equal(getScheduleModeForCronDate(date), 'inventory_scan');
+  });
+
+  test('inventory scan is selected at minute 17 under the accelerated cadence', () => {
+    assert.equal(getScheduleModeForCronDate(new Date('2026-08-19T12:17:00.000Z')), 'inventory_scan');
+  });
+
+  test('curfew-blocked inventory scheduler starts no job, lease, cleanup, fetch, or notification work', async () => {
+    const sqlCalls = [];
+    const configRow = {
+      venue_id: 'segerstrom_center', venue_name: 'Segerstrom Center for the Arts',
+      timezone_name: 'America/Los_Angeles', security_tier: 'high', credential_refs_json: '{}',
+      config_json: JSON.stringify({
+        discoveryStrategy: 'segerstromProductionDiscovery', inventoryStrategy: 'segerstromDrillDown',
+        urlPattern: 'https://www.scfta.org/shows-events',
+        businessHours: { start: { hour: 7, minute: 30 }, end: { hour: 23, minute: 59 } }
+      })
+    };
+    const fakeDb = {
+      prepare(sql) {
+        sqlCalls.push(sql);
+        return {
+          bind: () => ({
+            first: async () => sql.includes('FROM venues v JOIN venue_runtime_configs') ? configRow : null,
+            run: async () => ({ success: true })
+          })
+        };
+      }
+    };
+    const waits = [];
+    await runScheduledCycle({ DB: fakeDb, WORKER_VENUE_ID: 'segerstrom_center' }, {
+      waitUntil: promise => waits.push(promise)
+    }, {
+      forcedMode: 'inventory_scan', now: new Date('2026-08-03T06:00:00-07:00')
+    });
+    await Promise.all(waits);
+    assert.ok(sqlCalls.some(sql => sql.includes('INSERT INTO worker_logs')));
+    assert.equal(sqlCalls.some(sql => /inventory_jobs|cleanup|events WHERE|DELETE FROM/i.test(sql)), false);
   });
 
   test('drop watch is selected every five minutes', () => {
@@ -269,8 +321,8 @@ const run = async () => {
     assert.match(message, /Buy: https:\/\/seatme\.scfta\.org\/single\?id=30586/);
   });
 
-  test('listing watcher is selected at minute 17', () => {
-    const date = new Date(Date.UTC(2026, 7, 3, 0, 17, 0));
+  test('listing watcher is selected at minute 12', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 12, 0));
     assert.equal(getScheduleModeForCronDate(date), 'listing_watch');
   });
 

@@ -36,6 +36,7 @@ import {
   buildOperationalTelemetrySnapshot,
   inferVenueTimeZone,
   isMonitoringWindowActive,
+  formatVenueLocalTime,
   getScheduleModeForCronDate,
   isSkyboxListingEnabled,
   isBlockLikeStatus,
@@ -592,7 +593,11 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
     const boundDebugLog = (message, level) => debugLogAndNotify(env, ctx, message, level);
     const boundApiFetch = (url, opts) => executeApiFetch(url, { ...opts, debugLog: boundDebugLog });
 
-    const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, executeSecureFetch, trackWorkerLog, adapter, boundApiFetch);
+    const secureFetchForScan = (fetchEnv, url, row, fetchOptions = {}) => executeSecureFetch(fetchEnv, url, row, {
+      ...fetchOptions,
+      requestBudget: fetchOptions.requestBudget || options.requestBudget
+    });
+    const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, secureFetchForScan, trackWorkerLog, adapter, boundApiFetch);
     const scanDurationMs = Date.now() - scanStartedAtMs;
     let inventoryCandidates = [];
     let inventoryCandidatePolicy = 'not_applied_position_policy_not_not_applicable';
@@ -810,6 +815,9 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
   const eventById = new Map((await getUpcomingInventoryEvents(env.DB, adapter.venueId))
     .map(event => [event.event_id, event]));
   const batchLimit = Math.min(adapter.inventoryBatchSize, remainingEventIds.length);
+  // Cloudflare permits 50 subrequests per invocation. Keep one request in
+  // reserve and share the budget across every event in this batch.
+  const requestBudget = { limit: adapter.inventoryExternalRequestBudget, remaining: adapter.inventoryExternalRequestBudget };
   let attempted = 0;
   let completed = 0;
   let failed = 0;
@@ -817,6 +825,19 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
   const productionTimings = new Map();
 
   while (attempted < batchLimit && remainingEventIds.length && Date.now() < deadlineMs) {
+    if (!isMonitoringWindowActive(new Date(), adapter.timezoneName, adapter.businessHours)) {
+      const context = {
+        scheduleMode: 'inventory_scan', venueId: adapter.venueId,
+        timezone: adapter.timezoneName,
+        localTime: formatVenueLocalTime(new Date(), adapter.timezoneName),
+        businessHours: adapter.businessHours,
+        reason: 'outside_monitoring_window',
+        jobId: job.id, remainingEventCount: remainingEventIds.length
+      };
+      console.log('[SCHEDULER] Curfew active; inventory job checkpoint left untouched.', context);
+      await trackWorkerLog(env, ctx, 'info', 'Curfew active; no inventory event started', context);
+      break;
+    }
     const eventId = remainingEventIds.shift();
     const targetRow = eventById.get(eventId);
     attempted += 1;
@@ -828,7 +849,7 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
       now: new Date(), skipJitter: true, runParser: true,
       logPrefix: '[ALL EVENTS INVENTORY]', adapter,
       inventoryJobId: job.id, scanSource: 'all_events_inventory',
-      targetQuantities: adapter.inventoryTargetQuantities
+      targetQuantities: adapter.inventoryTargetQuantities, requestBudget
     });
     if (result.status === 'completed') completed += 1;
     else if (result.status === 'skipped') skipped += 1;
@@ -869,6 +890,8 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
     console.log('[ALL EVENTS INVENTORY] Batch checkpointed', {
       jobId: job.id, batchNumber, attempted, completed, failed, skipped,
       remaining: remainingEventIds.length, durationMs: batchCompletedAt.getTime() - batchStartedAt.getTime(),
+      externalRequestsUsed: requestBudget.limit - requestBudget.remaining,
+      externalRequestsRemaining: requestBudget.remaining,
       productions: Object.fromEntries(productionTimings)
     });
   }
@@ -902,7 +925,7 @@ async function runDropWatchForVenue(adapter, env, ctx, now) {
   return { attempted: targets.length, completed, failed };
 }
 
-async function runScheduledCycle(env, ctx, options = {}) {
+export async function runScheduledCycle(env, ctx, options = {}) {
   const now = options.now || new Date();
   const scheduleMode = options.forcedMode || getScheduleModeForCronDate(now);
 
@@ -912,7 +935,25 @@ async function runScheduledCycle(env, ctx, options = {}) {
     console.log('====================================================');
 
     const activeAdapters = await getWorkerScopedAdapters(env);
-    const activeVenueIds = activeAdapters.map(adapter => adapter.venueId);
+    // Scheduled work is prohibited outside each venue's local monitoring
+    // window. Log the intentional no-op before any job, cleanup, lease, or
+    // external request is started.
+    const runnableAdapters = [];
+    for (const adapter of activeAdapters) {
+      if (scheduleMode !== 'idle' && !isMonitoringWindowActive(now, adapter.timezoneName, adapter.businessHours)) {
+        const context = {
+          scheduleMode, venueId: adapter.venueId, timezone: adapter.timezoneName,
+          localTime: formatVenueLocalTime(now, adapter.timezoneName),
+          businessHours: adapter.businessHours, reason: 'outside_monitoring_window'
+        };
+        console.log('[SCHEDULER] Curfew active; no work started.', context);
+        await trackWorkerLog(env, ctx, 'info', 'Curfew active; scheduled work not started', context);
+        continue;
+      }
+      runnableAdapters.push(adapter);
+    }
+    if (scheduleMode !== 'idle' && !runnableAdapters.length) return;
+    const activeVenueIds = runnableAdapters.map(adapter => adapter.venueId);
 
     if (scheduleMode === 'listing_watch') {
       await trackWorkerLog(env, ctx, 'info', 'Fast listing watcher pass started', { scheduleMode });
@@ -946,7 +987,7 @@ async function runScheduledCycle(env, ctx, options = {}) {
 
     if (scheduleMode === 'drop_watch') {
       await trackWorkerLog(env, ctx, 'info', 'High-priority sold-out drop-watch pass started', { scheduleMode });
-      for (const adapter of activeAdapters) {
+      for (const adapter of runnableAdapters) {
         await deliverPendingDropAlerts(env, 20);
         await runDropWatchForVenue(adapter, env, ctx, now);
       }
@@ -958,7 +999,7 @@ async function runScheduledCycle(env, ctx, options = {}) {
       await trackWorkerLog(env, ctx, 'info', 'Discovery scan pass started', { scheduleMode });
       console.log('[DISCOVERY SCAN] Initiating discovery for all active venues.');
 
-      for (const adapter of activeAdapters) {
+      for (const adapter of runnableAdapters) {
         // Run discovery for any active venue that has a calendar page URL defined.
         if (adapter && adapter.urlPattern) {
           console.log(`[DISCOVERY SCAN] Running discovery for venue: ${adapter.venueName}`);
@@ -993,7 +1034,7 @@ async function runScheduledCycle(env, ctx, options = {}) {
     if (scheduleMode === 'inventory_scan') {
       await Promise.all([cleanupPastEvents(env.DB), cleanupOldWorkerLogs(env.DB)]);
     }
-    for (const adapter of activeAdapters) await runInventoryJobForVenue(adapter, env, ctx, now);
+    for (const adapter of runnableAdapters) await runInventoryJobForVenue(adapter, env, ctx, now);
   } catch (err) {
     console.error('[SCHEDULED ERROR]', err);
     await trackWorkerLog(env, ctx, 'error', 'Scheduled handler failed', { scheduleMode, error: String(err) });
@@ -1482,8 +1523,8 @@ Outcome: Transaction blocked automatically before a ghost sale collision could o
     // sentinels, so this override is inert in production.
     const productionCronModes = {
       '*/5 * * * *': 'drop_watch',
-      '9,29,59 * * * *': 'inventory_scan',
-      '17,27,57 * * * *': 'listing_watch',
+      '7,17,27,37,47,57 * * * *': 'inventory_scan',
+      '12,32,52 * * * *': 'listing_watch',
       '3-58/5 * * * *': 'discovery_scan'
     };
     const forcedMode =

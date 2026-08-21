@@ -32,6 +32,9 @@ function buildAdapter(row, env) {
   const inventoryMaxRunDurationMs = Number.isInteger(Number(config.inventoryMaxRunDurationMs))
     ? Math.min(120000, Math.max(10000, Number(config.inventoryMaxRunDurationMs)))
     : 45000;
+  const inventoryExternalRequestBudget = Number.isInteger(Number(config.inventoryExternalRequestBudget))
+    ? Math.min(49, Math.max(8, Number(config.inventoryExternalRequestBudget)))
+    : 48;
   const dropWatchBatchSize = Number.isInteger(Number(config.dropWatchBatchSize))
     ? Math.min(20, Math.max(1, Number(config.dropWatchBatchSize)))
     : 12;
@@ -62,6 +65,7 @@ function buildAdapter(row, env) {
       inventoryBufferBlockCount,
       inventoryBatchSize,
       inventoryMaxRunDurationMs,
+      inventoryExternalRequestBudget,
       dropWatchBatchSize,
       automaticSoldOutIntervalMinutes,
       inventoryTargetQuantities: inventoryTargetQuantities.length ? inventoryTargetQuantities : [2, 6]
@@ -110,6 +114,7 @@ export function buildPublicVenueSummary(adapter) {
     inventoryBufferBlockCount: adapter.inventoryBufferBlockCount,
     inventoryBatchSize: adapter.inventoryBatchSize,
     inventoryMaxRunDurationMs: adapter.inventoryMaxRunDurationMs,
+    inventoryExternalRequestBudget: adapter.inventoryExternalRequestBudget,
     dropWatchBatchSize: adapter.dropWatchBatchSize,
     automaticSoldOutIntervalMinutes: adapter.automaticSoldOutIntervalMinutes,
     inventoryTargetQuantities: adapter.inventoryTargetQuantities

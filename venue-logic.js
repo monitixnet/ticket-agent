@@ -87,6 +87,21 @@ export function isMonitoringWindowActive(date = new Date(), timeZone = "UTC", bu
   return localMinutes >= startMinutes && localMinutes <= endMinutes;
 }
 
+// Keep scheduler audit records in the venue's own clock, never the Worker host
+// or the operator's browser timezone.
+export function formatVenueLocalTime(date = new Date(), timeZone = "UTC") {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date).replace(", ", " ");
+}
+
 export function getScheduleModeForCronDate(date = new Date()) {
   const minute = Number(date.getUTCMinutes());
   if (CRON_SCHEDULE_CONFIG.dropWatchMinutes.has(minute)) return "drop_watch";

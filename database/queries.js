@@ -291,7 +291,10 @@ export async function getHallInventoryPolicy(db, venueHallId) {
   try {
     const metadata = JSON.parse(row.metadata_json || '{}');
     return {
-      inventoryEnabled: metadata.inventory_enabled === true,
+      // SQLite JSON stores SQL TRUE as numeric 1. Accept both valid JSON
+      // representations so a hall enabled by a migration is not treated as
+      // discovery-only at runtime.
+      inventoryEnabled: metadata.inventory_enabled === true || metadata.inventory_enabled === 1,
       seatPositionPolicy: metadata.seat_position_policy || null,
       seatPositionZone: metadata.seat_position_zone || 'unclassified'
     };
