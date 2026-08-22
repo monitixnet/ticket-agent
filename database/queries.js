@@ -206,6 +206,43 @@ export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityInte
   return result?.results || [];
 }
 
+// A critical watch is unhealthy when it has not received a successful live
+// inventory observation within twice its configured cadence. This query is
+// intentionally limited to explicit critical rules: automatic medium watches
+// should not page the operator during ordinary batch delays.
+export async function getStaleCriticalDropWatchEvents(db, venueId, staleAfterMinutes) {
+  const minutes = Math.max(10, Number(staleAfterMinutes) || 10);
+  const result = await db.prepare(`SELECT e.id AS event_id, s.show_name, e.showtime,
+      e.discovery_outcome, eis.availability_state, eis.last_observed_at
+    FROM inventory_watch_rules wr
+    JOIN shows s ON s.venue_id = wr.venue_id AND s.show_name = wr.show_name
+    JOIN events e ON e.show_id = s.id
+    LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
+    WHERE wr.venue_id = ? AND wr.enabled = 1 AND wr.priority = 'critical'
+      AND e.showtime >= datetime('now')
+      AND (eis.last_observed_at IS NULL
+        OR datetime(eis.last_observed_at, '+' || ? || ' minutes') <= datetime('now'))
+    ORDER BY eis.last_observed_at ASC, e.showtime ASC`).bind(venueId, minutes).all();
+  return result?.results || [];
+}
+
+export async function getDropWatchHealthAlertState(db, venueId) {
+  const row = await db.prepare('SELECT value_string FROM system_state WHERE key_name = ?')
+    .bind(`drop_watch_health_alert:${venueId}`).first();
+  if (!row?.value_string) return null;
+  try { return JSON.parse(row.value_string); } catch { return null; }
+}
+
+export function setDropWatchHealthAlertState(db, venueId, state) {
+  return db.prepare('INSERT OR REPLACE INTO system_state (key_name, value_string) VALUES (?, ?)')
+    .bind(`drop_watch_health_alert:${venueId}`, JSON.stringify(state || {})).run();
+}
+
+export function clearDropWatchHealthAlertState(db, venueId) {
+  return db.prepare('DELETE FROM system_state WHERE key_name = ?')
+    .bind(`drop_watch_health_alert:${venueId}`).run();
+}
+
 // The alert insertion happens before the state upsert in one D1 batch. That
 // makes a sold_out -> available transition idempotent: retries of the same
 // observation cannot send another alert, while a return to sold_out re-arms a

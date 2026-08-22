@@ -10,6 +10,10 @@ import {
   persistInventoryCandidates,
   recordInventoryEndpointTelemetry,
   getDueDropWatchEvents,
+  getStaleCriticalDropWatchEvents,
+  getDropWatchHealthAlertState,
+  setDropWatchHealthAlertState,
+  clearDropWatchHealthAlertState,
   recordInventoryAvailabilityObservation,
   recordInventoryCandidateObservation,
   getPendingInventoryDropAlerts,
@@ -343,6 +347,35 @@ function formatCurrency(cents) {
   return Number.isFinite(Number(cents)) ? `$${(Number(cents) / 100).toFixed(2)}` : 'price unavailable';
 }
 
+// Event times from Tessitura are a mix of ISO instants and venue-local D1
+// timestamps. Preserve a timezone-less value as the venue's wall-clock time;
+// convert an ISO instant into the venue timezone. Telegram should never expose
+// raw database timestamps to an operator.
+export function formatAlertDateTime(value, timeZone = 'America/Los_Angeles') {
+  const raw = String(value || '').trim();
+  if (!raw) return 'time unavailable';
+  const options = {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true
+  };
+  const hasExplicitZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  if (hasExplicitZone) {
+    const date = new Date(raw);
+    if (Number.isFinite(date.getTime())) {
+      return new Intl.DateTimeFormat('en-US', { ...options, timeZone, timeZoneName: 'short' }).format(date);
+    }
+  }
+  const parts = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/);
+  if (!parts) return raw;
+  const wallClock = new Date(Date.UTC(
+    Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]), Number(parts[4]), Number(parts[5])
+  ));
+  const display = new Intl.DateTimeFormat('en-US', { ...options, timeZone: 'UTC' }).format(wallClock);
+  const zoneName = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'short' })
+    .formatToParts(wallClock).find(part => part.type === 'timeZoneName')?.value;
+  return zoneName ? `${display} ${zoneName}` : display;
+}
+
 export function buildDropAlertMessage(payload = {}) {
   const maxPriceCents = normalizeDropPriceCapCents(payload.maxPriceCents);
   const priceRule = maxPriceCents !== null
@@ -368,14 +401,14 @@ export function buildDropAlertMessage(payload = {}) {
     `Venue: ${payload.venueName}`,
     `Hall: ${payload.venueHall || 'unresolved'}`,
     `Show: ${payload.showName}`,
-    `Performance: ${payload.showtime}`,
+    `Performance: ${formatAlertDateTime(payload.showtime, payload.timezoneName)}`,
     `Event ID: ${payload.eventId}`,
     `Eligible seats detected: ${payload.availableItemCount} (${priceRange})`,
     priceRule,
     `Sections: ${sectionSummary}`,
     `Eligible-seat sample:\n${seatSamples}`,
     ...(candidateSamples ? [`Buffered candidate blocks:\n${candidateSamples}`] : []),
-    `Observed: ${payload.observedAt}`,
+    `Observed: ${formatAlertDateTime(payload.observedAt, payload.timezoneName)}`,
     `Buy: ${payload.eventUrl || 'direct URL unavailable'}`,
     'Possible opportunity only—verify live availability and resale economics before buying.'
   ].join('\n');
@@ -397,9 +430,9 @@ export function buildCandidateAlertMessage(payload = {}) {
     `Venue: ${payload.venueName}`,
     `Hall: ${payload.venueHall || 'unresolved'}`,
     `Show: ${payload.showName}`,
-    `Performance: ${payload.showtime}`,
+    `Performance: ${formatAlertDateTime(payload.showtime, payload.timezoneName)}`,
     `Candidates:\n${candidateLines}`,
-    `Observed: ${payload.observedAt}`,
+    `Observed: ${formatAlertDateTime(payload.observedAt, payload.timezoneName)}`,
     `Buy: ${payload.eventUrl || 'direct URL unavailable'}`,
     'Possible opportunity only—verify live availability and resale economics before buying.'
   ].join('\n');
@@ -443,6 +476,74 @@ async function deliverPendingCandidateAlerts(env, limit = 10) {
     }
   }
   return alerts.length;
+}
+
+function buildStaleDropWatchAlertMessage(adapter, staleEvents, staleAfterMinutes, observedAt) {
+  const byShow = new Map();
+  for (const event of staleEvents) {
+    const showName = event.show_name || 'Unknown show';
+    const group = byShow.get(showName) || { count: 0, oldest: event.last_observed_at || 'never' };
+    group.count += 1;
+    if (!group.oldest || group.oldest === 'never' || (event.last_observed_at && event.last_observed_at < group.oldest)) {
+      group.oldest = event.last_observed_at || 'never';
+    }
+    byShow.set(showName, group);
+  }
+  const details = [...byShow.entries()]
+    .map(([showName, group]) => `${showName}: ${group.count} performance(s), oldest scan ${group.oldest}`)
+    .join('\n');
+  return [
+    '⚠️ CRITICAL DROP WATCH STALE',
+    `Venue: ${adapter.venueName}`,
+    `No successful inventory observation within ${staleAfterMinutes} minutes:`,
+    details,
+    `Observed: ${observedAt}`,
+    'Action: Check Worker logs and venue access before relying on drop alerts.'
+  ].join('\n');
+}
+
+async function auditCriticalDropWatchHealth(adapter, env, ctx, now) {
+  const criticalIntervalMinutes = Number(adapter.dropWatchIntervalsMinutes?.critical) || 5;
+  const staleAfterMinutes = criticalIntervalMinutes * 2;
+  const staleEvents = await getStaleCriticalDropWatchEvents(env.DB, adapter.venueId, staleAfterMinutes);
+  if (!staleEvents.length) {
+    await clearDropWatchHealthAlertState(env.DB, adapter.venueId);
+    console.log('[DROP WATCH HEALTH] Critical watches are current.', { venueId: adapter.venueId, staleAfterMinutes });
+    return { staleCount: 0, alerted: false };
+  }
+
+  const state = await getDropWatchHealthAlertState(env.DB, adapter.venueId);
+  const lastNotifiedMs = Date.parse(state?.lastNotifiedAt || '');
+  const throttleMs = 30 * 60 * 1000;
+  const shouldAlert = !Number.isFinite(lastNotifiedMs) || (now.getTime() - lastNotifiedMs) >= throttleMs;
+  const context = {
+    venueId: adapter.venueId,
+    staleAfterMinutes,
+    staleCount: staleEvents.length,
+    staleEventIds: staleEvents.map(event => event.event_id),
+    shows: [...new Set(staleEvents.map(event => event.show_name))]
+  };
+  await trackWorkerLog(env, ctx, 'error', 'Critical drop-watch freshness violation', context);
+  console.error('[DROP WATCH HEALTH] Critical watches are stale.', context);
+  if (shouldAlert) {
+    try {
+      await deliverCriticalNotification(env, buildStaleDropWatchAlertMessage(
+        adapter, staleEvents, staleAfterMinutes, now.toISOString()
+      ));
+      await setDropWatchHealthAlertState(env.DB, adapter.venueId, {
+        lastNotifiedAt: now.toISOString(), staleEventIds: staleEvents.map(event => event.event_id)
+      });
+    } catch (error) {
+      // Observability must never prevent the recovery scan that can repair the
+      // stale condition. Leave the throttle state untouched so the next pass
+      // retries notification delivery.
+      console.error(`[DROP WATCH HEALTH] Stale-watch alert delivery failed: ${error.message}`);
+      await trackWorkerLog(env, ctx, 'error', 'Critical drop-watch stale alert delivery failed', {
+        ...context, error: error.message
+      });
+    }
+  }
+  return { staleCount: staleEvents.length, alerted: shouldAlert };
 }
 
 function isRequestAuthorized(request, env) {
@@ -825,6 +926,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             eventId: targetRow.event_id,
             venueName: targetRow.venue_name,
             venueHall: targetRow.venue_hall,
+            timezoneName: targetRow.timezone_name,
             showName: targetRow.show_name,
             showtime: targetRow.showtime,
             eventUrl: targetRow.event_url,
@@ -894,6 +996,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             alertPayload: {
               venueName: targetRow.venue_name,
               venueHall: targetRow.venue_hall,
+              timezoneName: targetRow.timezone_name,
               showName: targetRow.show_name,
               showtime: targetRow.showtime,
               eventUrl: targetRow.event_url,
@@ -1301,6 +1404,7 @@ export async function runScheduledCycle(env, ctx, options = {}) {
     if (scheduleMode === 'drop_watch') {
       await trackWorkerLog(env, ctx, 'info', 'High-priority sold-out drop-watch pass started', { scheduleMode });
       for (const adapter of runnableAdapters) {
+        await auditCriticalDropWatchHealth(adapter, env, ctx, now);
         await deliverPendingDropAlerts(env, 20);
         await deliverPendingCandidateAlerts(env, 10);
         await runDropWatchForVenue(adapter, env, ctx, now);

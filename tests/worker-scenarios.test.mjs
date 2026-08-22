@@ -6,6 +6,7 @@ import {
   buildNotificationRequest,
   buildDropAlertMessage,
   buildCandidateAlertMessage,
+  formatAlertDateTime,
   filterInventoryForDropPriceRule,
   isSubrequestBudgetExhaustion,
   buildServerIssuedCookieHeader,
@@ -58,6 +59,7 @@ import {
   markDiscoveredSoldOutEvents,
   getHallInventoryPolicy,
   getDueDropWatchEvents,
+  getStaleCriticalDropWatchEvents,
   getPendingInventoryDropAlerts,
   recordInventoryAvailabilityObservation,
 } from '../database/queries.js';
@@ -186,6 +188,23 @@ const run = async () => {
     const outcomeUpdate = statements.find(statement => statement.sql.includes('UPDATE events SET discovery_outcome'));
     assert.deepEqual(outcomeUpdate?.values, ['sold_out', '2026-08-22T16:00:00.000Z', 'phantom-event']);
     assert.equal(result.discoveryOutcome, 'sold_out');
+  });
+
+  test('critical drop-watch health audit checks only explicitly configured critical rules', async () => {
+    let capturedSql = '';
+    let capturedValues = [];
+    const fakeDb = { prepare(sql) {
+      capturedSql = sql;
+      return { bind: (...values) => {
+        capturedValues = values;
+        return { all: async () => ({ results: [] }) };
+      } };
+    } };
+    await getStaleCriticalDropWatchEvents(fakeDb, 'segerstrom_center', 10);
+    assert.match(capturedSql, /wr\.priority = 'critical'/);
+    assert.match(capturedSql, /wr\.enabled = 1/);
+    assert.match(capturedSql, /datetime\(eis\.last_observed_at, '\+' \|\| \? \|\| ' minutes'\)/);
+    assert.deepEqual(capturedValues, ['segerstrom_center', 10]);
   });
 
   test('job runtime timers render comparable elapsed durations', () => {
@@ -427,9 +446,10 @@ const run = async () => {
       sectionSummaries: [{ section: 'Orchestra', availableSeats: 8 }],
       eligibleSeatSamples: [{ section: 'Orchestra', row: 'D', seat: '12', priceCents: 12500 }],
       eligibleCandidateBlocks: [{ targetQuantity: 2, section: 'Orchestra', row: 'D', startSeat: '12', endSeat: '13', priceCents: 12500 }],
-      observedAt: '2026-08-20T12:00:00.000Z'
+      observedAt: '2026-08-20T12:00:00.000Z', timezoneName: 'America/Los_Angeles'
     });
     assert.match(message, /Hall: Segerstrom Hall/);
+    assert.match(message, /Performance: Thursday, August 20, 2026 at 7:30 PM PDT/);
     assert.match(message, /Event ID: 30586/);
     assert.match(message, /\$125\.00–\$170\.00/);
     assert.match(message, /Row D, Seat 12/);
@@ -446,12 +466,23 @@ const run = async () => {
     const message = buildCandidateAlertMessage({
       venueName: 'Segerstrom Center for the Arts', venueHall: 'Segerstrom Hall',
       showName: 'Example Show', showtime: '2026-09-01 19:30:00', eventUrl: 'https://seatme.example/event',
-      observedAt: '2026-08-22T00:00:00.000Z',
+      observedAt: '2026-08-22T00:00:00.000Z', timezoneName: 'America/Los_Angeles',
       checkoutFeeRule: { type: 'percentage_per_ticket', rateBasisPoints: 1800 },
       candidates: [{ targetQuantity: 2, section: 'Orchestra', row: 'D', startSeat: '10', endSeat: '11', priceCents: 12500, bufferBlocks: [{ row: 'C' }] }]
     });
     assert.match(message, /Qty 2: Orchestra, Row D, Seats 10–11 \(\$125\.00 \+ \$22\.50 fee = \$147\.50 each; \$295\.00 all-in total\)/);
     assert.doesNotMatch(message, /buffer|Row C/i);
+  });
+
+  test('alert times are readable in the venue timezone without shifting wall-clock D1 timestamps', () => {
+    assert.equal(
+      formatAlertDateTime('2026-12-10 19:00:00', 'America/Los_Angeles'),
+      'Thursday, December 10, 2026 at 7:00 PM PST'
+    );
+    assert.equal(
+      formatAlertDateTime('2026-08-22T02:30:00.000Z', 'America/Los_Angeles'),
+      'Friday, August 21, 2026 at 7:30 PM PDT'
+    );
   });
 
   test('Segerstrom checkout fee rule rounds 18 percent per ticket', () => {
