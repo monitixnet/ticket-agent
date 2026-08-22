@@ -168,8 +168,11 @@ export async function persistInventoryCandidates(db, snapshot = {}) {
 }
 
 // A watch rule is a venue-scoped control-plane instruction, not a hard-coded
-// title. A performance is due only while discovery still classifies it as
-// sold out and its configured priority interval has elapsed.
+// title. A performance is due while its last successful inventory observation
+// is sold out and either discovery also says sold_out or an explicit rule has
+// opted that exact show into monitoring. The explicit-rule branch repairs
+// legacy/stale discovery rows (such as Phantom) without admitting arbitrary
+// unknown events into the drop lane.
 export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityIntervals = {}) {
   const intervals = {
     critical: Math.max(5, Number(priorityIntervals.critical) || 5),
@@ -190,12 +193,11 @@ export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityInte
       ON wr.venue_id = v.id AND wr.show_name = s.show_name AND wr.enabled = 1
     LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
     WHERE v.id = ? AND e.showtime >= datetime('now')
-      AND e.discovery_outcome = 'sold_out'
-      AND (
-        eis.availability_state = 'sold_out' AND (eis.last_observed_at IS NULL
-          OR datetime(eis.last_observed_at, '+' || CASE COALESCE(wr.priority, 'medium')
-            WHEN 'critical' THEN ? WHEN 'high' THEN ? WHEN 'low' THEN ? ELSE ? END || ' minutes') <= datetime('now'))
-      )
+      AND eis.availability_state = 'sold_out'
+      AND (e.discovery_outcome = 'sold_out' OR wr.id IS NOT NULL)
+      AND (eis.last_observed_at IS NULL
+        OR datetime(eis.last_observed_at, '+' || CASE COALESCE(wr.priority, 'medium')
+          WHEN 'critical' THEN ? WHEN 'high' THEN ? WHEN 'low' THEN ? ELSE ? END || ' minutes') <= datetime('now'))
     ORDER BY CASE COALESCE(wr.priority, 'medium')
       WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
       eis.last_observed_at ASC, e.showtime ASC
@@ -212,6 +214,7 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
   if (!db || !observation.eventId || !observation.scanId || !observation.observedAt) return { dropDetected: false };
   const availableItemCount = Math.max(0, Number(observation.availableItemCount) || 0);
   const nextState = availableItemCount > 0 ? 'available' : 'sold_out';
+  const nextDiscoveryOutcome = nextState === 'available' ? 'on_sale' : 'sold_out';
   const alertId = observation.alertId || `${observation.scanId}:drop`;
   const payload = JSON.stringify(observation.alertPayload || {});
   const statements = [
@@ -238,11 +241,23 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
       updated_at = excluded.updated_at`)
       .bind(observation.eventId, nextState, availableItemCount, observation.scanId,
         observation.observedAt, observation.availabilityFingerprint || null,
-        observation.observedAt, observation.deepScanAt || null, observation.observedAt)
+        observation.observedAt, observation.deepScanAt || null, observation.observedAt),
+    // A successful SeatMe availability response is stronger and fresher than
+    // an old discovery classification for a future performance. Synchronize
+    // the inventory-derived outcome so it remains eligible for the correct
+    // inventory or drop-monitoring lane. Failed requests never reach here.
+    db.prepare(`UPDATE events SET discovery_outcome = ?, discovery_status_checked_at = ?
+      WHERE id = ? AND discovery_outcome NOT IN ('past', 'not_on_sale', 'free_no_tickets')`)
+      .bind(nextDiscoveryOutcome, observation.observedAt, observation.eventId)
   ];
   const results = await db.batch(statements);
   const inserted = results?.[0]?.meta?.changes ?? results?.[0]?.changes ?? 0;
-  return { dropDetected: inserted === 1, alertId: inserted === 1 ? alertId : null, availabilityState: nextState };
+  return {
+    dropDetected: inserted === 1,
+    alertId: inserted === 1 ? alertId : null,
+    availabilityState: nextState,
+    discoveryOutcome: nextDiscoveryOutcome
+  };
 }
 
 export async function getPendingInventoryDropAlerts(db, limit = 20) {

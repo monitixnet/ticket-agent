@@ -59,6 +59,7 @@ import {
   getHallInventoryPolicy,
   getDueDropWatchEvents,
   getPendingInventoryDropAlerts,
+  recordInventoryAvailabilityObservation,
 } from '../database/queries.js';
 import { normalizeExternalId } from '../utils.js';
 import { getActiveVenueAdapters } from '../database/venue-runtime-config.js';
@@ -160,8 +161,31 @@ const run = async () => {
     });
     assert.match(capturedSql, /wr\.venue_id = v\.id/);
     assert.match(capturedSql, /COALESCE\(wr\.priority, 'medium'\)/);
+    assert.match(capturedSql, /e\.discovery_outcome = 'sold_out' OR wr\.id IS NOT NULL/);
     assert.match(capturedSql, /WHEN 'critical' THEN 0/);
     assert.deepEqual(capturedValues, ['segerstrom_center', 5, 10, 60, 30, 20]);
+  });
+
+  test('successful inventory observations synchronize the latest eligibility outcome', async () => {
+    const statements = [];
+    const fakeDb = {
+      prepare(sql) {
+        return {
+          bind: (...values) => {
+            statements.push({ sql, values });
+            return {};
+          }
+        };
+      },
+      batch: async () => [{ meta: { changes: 0 } }, { meta: { changes: 1 } }, { meta: { changes: 1 } }]
+    };
+    const result = await recordInventoryAvailabilityObservation(fakeDb, {
+      eventId: 'phantom-event', scanId: 'scan-1', observedAt: '2026-08-22T16:00:00.000Z',
+      availableItemCount: 0
+    });
+    const outcomeUpdate = statements.find(statement => statement.sql.includes('UPDATE events SET discovery_outcome'));
+    assert.deepEqual(outcomeUpdate?.values, ['sold_out', '2026-08-22T16:00:00.000Z', 'phantom-event']);
+    assert.equal(result.discoveryOutcome, 'sold_out');
   });
 
   test('job runtime timers render comparable elapsed durations', () => {
