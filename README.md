@@ -41,9 +41,14 @@ ALGOLIA_SEGERSTROM_API_KEY="your_segerstrom_algolia_search_key"
 NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 CRITICAL_NOTIFICATION_OUTBOUND_URL="https://telegram.org..."
 WEBHOOK_SHARED_SECRET="your_shared_secret_here"
+VENUE_SESSION_ENCRYPTION_KEY="base64_encoded_32_byte_key"
 ```
 
 When D1 debug telemetry is enabled for a venue, inventory requests record response metadata in `inventory_endpoint_telemetry`: event/job, endpoint type, provider, HTTP status, content type, redirect indicator, outcome, and duration. It never stores cookies, request headers, URLs with query data, or response bodies. Rows are retained for 30 days. This diagnostic control is independent of Telegram debug notifications.
+
+### Venue validation recovery
+
+SeatMe can return a human-validation HTML page with HTTP `200`, rather than JSON. The Worker recognizes the page from its explicit validation markers, records an endpoint-telemetry outcome of `venue_validation_challenge`, sends one critical operational notification, and sets a venue-wide cooldown. The inventory event is returned to the front of its leased queue; the job is checkpointed and cannot be marked complete during that cooldown. The Worker never attempts to read or submit a CAPTCHA or validation code.
 
 `WEBHOOK_SHARED_SECRET` authenticates callers of the endpoints below. Requests must include it as an `X-Webhook-Secret` header; requests without a matching header are rejected with `401`. Generate a real value yourself — it's just a random secret, not tied to any external system — for example: `openssl rand -hex 32`. Whoever calls `/webhook/validate` or `/logs/recent` needs to be given that same value to send back as the header. Today that's limited to your own tooling and local testing, since there is no live Skybox integration yet (see [Hard boundaries](#hard-boundaries)).
 
@@ -67,8 +72,9 @@ SELECT
   json_extract(c.config_json, '$.fetchProviderPool') AS fetch_provider_pool,
   json_extract(c.config_json, '$.discoveryMaxPages') AS discovery_max_pages,
   json_extract(c.config_json, '$.discoveryBatchSize') AS discovery_batch_size,
-  json_extract(c.config_json, '$.inventoryBatchSize') AS inventory_batch_size,
+  json_extract(c.config_json, '$.inventoryMaxEventsPerRun') AS inventory_max_events_per_run,
   json_extract(c.config_json, '$.inventoryExternalRequestBudget') AS inventory_request_budget,
+  json_extract(c.config_json, '$.checkoutFeeRule') AS checkout_fee_rule,
   json_extract(c.config_json, '$.debugTelemetryEnabled') AS debug_telemetry_enabled,
   json_extract(c.config_json, '$.discoveryAllowedHalls') AS discovery_allowed_halls
 FROM venue_runtime_configs c
@@ -87,6 +93,24 @@ WHERE venue_id = 'segerstrom_center';
 ```
 
 `credential_refs_json` may be inspected to see secret *names*, but never contains secret values.
+
+### Native SeatMe session bootstrap
+
+Segerstrom can require a normal SCFTA cart bootstrap before SeatMe inventory APIs return JSON. The Worker supports an opt-in, venue-scoped session manager: it stores only server-issued cookies encrypted with AES-GCM in `system_state`, reuses them for native SeatMe API calls, and performs one cart bootstrap plus one retry when SeatMe returns a session redirect. It never imports browser/Postman cookies, logs values, or sends those cookies through a proxy provider.
+
+Generate the required secret locally with `openssl rand -base64 32` and set it as `VENUE_SESSION_ENCRYPTION_KEY` in `.dev.vars`; set the same value as a Worker secret before enabling the feature remotely. Enable it only in the relevant venue's D1 `config_json`:
+
+```sql
+UPDATE venue_runtime_configs
+SET config_json = json_set(
+  config_json,
+  '$.sessionBootstrapEnabled', true,
+  '$.sessionTtlMinutes', 15
+)
+WHERE venue_id = 'segerstrom_center';
+```
+
+The manager activates only when that venue uses the native API provider pool exclusively. Test `/operations/session-smoke-test` first; do not enable scheduled use until the isolated test returns `section_availability_array`.
 
 ### Reset local discovery progress
 
@@ -172,13 +196,56 @@ curl -X POST http://localhost:8787/discovery/single-production \
   --data '{"production_id":"30573","title":"Phantom of the Opera"}'
 ```
 
-All-events inventory uses the same event scan path as `/inventory/single-event`. It resumes one leased D1 job per venue, processing up to `inventoryBatchSize` events or `inventoryMaxRunDurationMs` per cron invocation. Segerstrom is configured for six events, a 48-request shared invocation budget (below Cloudflare's 50-subrequest limit), `45000` ms, target quantities `[2,6]`, and two backup blocks. If its venue-local monitoring window is closed, the scheduler records a curfew audit entry and starts no job, lease, cleanup, external request, or notification work.
+All-events inventory uses the same event scan path as `/inventory/single-event`. It resumes one leased D1 job per venue and processes as many events as fit within the configured external-request and runtime budgets. `inventoryMaxEventsPerRun` is only a ceiling for cheap availability-only checks; it is not a fixed batch size. Segerstrom uses a 48-request shared invocation budget (below Cloudflare's 50-subrequest limit), a `45000` ms runtime budget, target quantity packs `[2,4,6,8,10]`, and two backup blocks. Broad inventory scans only events most recently classified by discovery as `on_sale` or `sold_out`; all other classifications are excluded. If its venue-local monitoring window is closed, the scheduler records a curfew audit entry and starts no job, lease, cleanup, external request, or notification work.
 
 ### Sold-out drop watch
 
 High-priority drop watches are separate from resale candidate rules. Every successful inventory scan records a performance state. A scan with zero available seats records `sold_out`; that performance is then automatically promoted into the priority drop lane. A later successful scan with any available seat creates one durable D1 alert and immediately delivers it through `CRITICAL_NOTIFICATION_OUTBOUND_URL`. Failed deliveries stay in `inventory_drop_alerts` and retry with bounded backoff. The alert is re-armed only after that performance becomes sold out again.
 
-Migration `0017_inventory_drop_watch.sql` seeds `Phantom of the Opera` at Segerstrom with a five-minute desired interval, so it receives priority immediately instead of waiting for its first broad scan. Drop watch has its own every-five-minute schedule (`*/5`) and does not run an all-events batch. Segerstrom's `dropWatchBatchSize` is `12`, enough to cover all currently discovered Phantom performances in one bounded pass. Other successfully observed sold-out performances are automatically prioritized at `automaticSoldOutIntervalMinutes` (5). General inventory runs at `:07, :17, :27, :37, :47, :57`; listing watch runs at `:12, :32, :52`; discovery runs every five minutes offset at `3-58/5`. The Worker uses each venue's D1-configured local monitoring window as a hard curfew and records a structured no-work audit log when it is closed. To add another exact show, insert an enabled `inventory_watch_rules` row with its venue ID, exact saved show name, and desired interval; do not put notification URLs or secrets in D1.
+Qualified candidate alerts use `NOTIFICATION_OUTBOUND_URL`. A deep scan sends one concise message when its best actionable candidate set is new or materially changed. It contains only the target block—quantity, section, row, seats, and price. The two qualifying backup blocks remain an internal safety rule and are never included in Telegram. Alerts are durable and deduplicated per event; a later scan that finds no candidates marks any undelivered candidate alert obsolete.
+
+#### Checkout-fee rules
+
+`checkoutFeeRule` is venue-scoped D1 policy used only to calculate the displayed candidate economics; it never adds a seat to a cart or places an order. Migration `0036_add_segerstrom_checkout_fee_rule.sql` sets Segerstrom's verified rule to 18% per ticket, rounded to cents per ticket. Candidate Telegram messages then show ticket price, checkout fee, all-in per-ticket price, and all-in quantity total. Do not copy this rule to another venue without verifying that venue's own checkout response.
+
+Migration `0017_inventory_drop_watch.sql` seeds `Phantom of the Opera` at Segerstrom as a critical five-minute watch. Drop alerts currently fire for every confirmed ticket drop regardless of price; each Telegram includes observed price ranges and seat details. Drop watch has its own every-five-minute schedule (`*/5`) and does not run an all-events batch. Newly discovered sold-out events default to `medium` priority (30 minutes); `high` runs every 10 minutes, `low` every 60 minutes, and critical runs every five minutes. Explicit rules are always scoped by venue ID and exact saved show name; automatic sold-out monitoring needs no explicit rule. Segerstrom's `dropWatchBatchSize` is 20, enough to cover all current Phantom performances in one bounded pass. General inventory runs at `:07, :17, :27, :37, :47, :57`; listing watch runs at `:12, :32, :52`; discovery runs hourly at `:03` (`3 * * * *`). The Worker uses each venue's D1-configured local monitoring window as a hard curfew and records a structured no-work audit log when it is closed.
+
+#### Set an eligible-drop price rule
+
+`inventory_watch_rules.max_price_cents` is an **optional maximum ticket price**. `NULL` means every available ticket is eligible. A cap applies only to alerts for that exact `venue_id` and exact saved `show_name`; it never affects another venue or show.
+
+`enabled = 0` disables that rule's priority and price override; it does not opt a currently sold-out event out of automatic drop monitoring. Automatic monitoring is deliberately driven by the latest discovery status.
+
+Use the following command for a $170-or-less rule (replace the show and price as needed):
+
+```bash
+npx wrangler d1 execute ticket-agent-db --remote --command "
+INSERT INTO inventory_watch_rules (
+  id, venue_id, show_name, enabled, scan_interval_minutes, max_price_cents, priority
+) VALUES (
+  'segerstrom_center:watch:phantom-of-the-opera',
+  'segerstrom_center', 'Phantom of the Opera', 1, 5, 17000, 'critical'
+)
+ON CONFLICT(venue_id, show_name) DO UPDATE SET
+  enabled = 1,
+  max_price_cents = excluded.max_price_cents,
+  priority = excluded.priority,
+  updated_at = CURRENT_TIMESTAMP;
+"
+```
+
+To alert for **all prices** again, keep the same venue and show name and set the cap to `NULL`:
+
+```bash
+npx wrangler d1 execute ticket-agent-db --remote --command "
+UPDATE inventory_watch_rules
+SET max_price_cents = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE venue_id = 'segerstrom_center'
+  AND show_name = 'Phantom of the Opera';
+"
+```
+
+The price must be stored in cents: `$170.00` is `17000`, `$99.50` is `9950`. `scan_interval_minutes` is retained for schema compatibility; priority determines the active drop-watch cadence. The Telegram alert always includes the observed price range, even when the rule has no cap.
 
 Add `"include_seat_samples":true` to return real contiguous seat blocks for manual review.
 
@@ -252,7 +319,7 @@ After creating a Worker, add its required secrets in that Worker's Cloudflare se
 
 ```bash
 npx wrangler secret put ALGOLIA_SEGERSTROM_API_KEY
-npx wrangler secret put SCRAPEFLY_API_KEY
+npx wrangler secret put VENUE_SESSION_ENCRYPTION_KEY
 npx wrangler secret put NOTIFICATION_OUTBOUND_URL
 npx wrangler secret put WEBHOOK_SHARED_SECRET
 ```

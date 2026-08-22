@@ -11,9 +11,13 @@ import {
   recordInventoryEndpointTelemetry,
   getDueDropWatchEvents,
   recordInventoryAvailabilityObservation,
+  recordInventoryCandidateObservation,
   getPendingInventoryDropAlerts,
+  getPendingInventoryCandidateAlerts,
   markInventoryDropAlertDelivered,
   markInventoryDropAlertFailed,
+  markInventoryCandidateAlertDelivered,
+  markInventoryCandidateAlertFailed,
   getHallRowOrdering,
   getHallInventoryPolicy,
   getUpcomingInventoryEvents,
@@ -41,12 +45,24 @@ import {
   getScheduleModeForCronDate,
   isSkyboxListingEnabled,
   isBlockLikeStatus,
-  computeBackoffDelayMs
+  computeBackoffDelayMs,
+  isVenueValidationResponse
 } from './venue-logic.js';
-import { STRATEGY_REGISTRY, segerstromSingleProductionDiscovery } from './strategies.js';
+import { STRATEGY_REGISTRY, segerstromSingleProductionDiscovery, formatJobDuration } from './strategies.js';
 import { FETCH_PROVIDERS } from './fetch-providers.js';
 import { computeStringHash, delayExecution, randomBetween, computeJitteredDelay, buildWorkerLogId, timingSafeEqual } from './utils.js';
 import { getVenueAdapter, buildPublicVenueSummary } from './database/venue-runtime-config.js';
+import { calculateCandidateCheckoutAmounts } from './checkout-fees.js';
+import {
+  runEphemeralSessionBootstrap,
+  runEphemeralBootstrapThenTarget,
+  isSessionRedirectResponse,
+  loadVenueSessionCookieHeader,
+  mergeCookieHeaders,
+  saveVenueSessionCookieHeader,
+  sessionRequestHeaders
+} from './session-manager.js';
+export { buildServerIssuedCookieHeader } from './session-manager.js';
 
 export function buildHumanReviewNotification(payload = {}) {
   const coverage = payload.coverage || { targetQuantity: 1, equivalentInventoryCount: 0, requiredMinimum: 3, meetsRequirement: false };
@@ -76,10 +92,21 @@ export function buildHumanReviewNotification(payload = {}) {
 // A configured cap is fail-closed: a seat with no numeric price cannot qualify
 // for a price-bounded drop alert.
 export function filterInventoryForDropPriceRule(inventory = [], maxPriceCents = null) {
-  if (!Number.isFinite(Number(maxPriceCents))) return inventory;
+  // `null` is the persisted representation of an unbounded rule. Do not
+  // coerce it with Number(null), which would silently turn it into a $0 cap.
+  if (maxPriceCents === null || maxPriceCents === undefined || maxPriceCents === '') return inventory;
+  if (!Number.isFinite(Number(maxPriceCents))) return [];
   const limit = Number(maxPriceCents);
   return inventory.filter(item => item?.priceCents != null && Number.isFinite(Number(item.priceCents))
     && Number(item.priceCents) <= limit);
+}
+
+export function normalizeDropPriceCapCents(value) {
+  // D1 represents an unbounded rule as NULL. Preserve that rather than
+  // allowing JavaScript's Number(null) coercion to create a $0 ceiling.
+  if (value === null || value === undefined || value === '') return null;
+  const cents = Number(value);
+  return Number.isFinite(cents) && cents >= 0 ? Math.round(cents) : null;
 }
 
 function buildPublicAdapterSummaries(adapters = []) {
@@ -317,8 +344,9 @@ function formatCurrency(cents) {
 }
 
 export function buildDropAlertMessage(payload = {}) {
-  const priceRule = Number.isFinite(Number(payload.maxPriceCents))
-    ? `Price rule: $${(Number(payload.maxPriceCents) / 100).toFixed(2)} or less`
+  const maxPriceCents = normalizeDropPriceCapCents(payload.maxPriceCents);
+  const priceRule = maxPriceCents !== null
+    ? `Price rule: $${(maxPriceCents / 100).toFixed(2)} or less`
     : 'Price rule: any available price';
   const priceRange = payload.lowestQualifyingPriceCents == null
     ? 'No qualifying price found'
@@ -353,6 +381,30 @@ export function buildDropAlertMessage(payload = {}) {
   ].join('\n');
 }
 
+export function buildCandidateAlertMessage(payload = {}) {
+  const candidates = (payload.candidates || []).slice(0, 3);
+  const candidateLines = candidates.map(candidate => {
+    const amounts = calculateCandidateCheckoutAmounts(
+      candidate.priceCents, candidate.targetQuantity, payload.checkoutFeeRule
+    );
+    const priceDetail = amounts
+      ? `${formatCurrency(amounts.unitPriceCents)} + ${formatCurrency(amounts.feePerTicketCents)} fee = ${formatCurrency(amounts.allInPerTicketCents)} each; ${formatCurrency(amounts.allInTotalCents)} all-in total`
+      : formatCurrency(candidate.priceCents);
+    return `Qty ${candidate.targetQuantity}: ${candidate.section}, Row ${candidate.row}, Seats ${candidate.startSeat}–${candidate.endSeat} (${priceDetail})`;
+  }).join('\n') || 'No qualified target block available';
+  return [
+    '🎟️ QUALIFIED INVENTORY CANDIDATE',
+    `Venue: ${payload.venueName}`,
+    `Hall: ${payload.venueHall || 'unresolved'}`,
+    `Show: ${payload.showName}`,
+    `Performance: ${payload.showtime}`,
+    `Candidates:\n${candidateLines}`,
+    `Observed: ${payload.observedAt}`,
+    `Buy: ${payload.eventUrl || 'direct URL unavailable'}`,
+    'Possible opportunity only—verify live availability and resale economics before buying.'
+  ].join('\n');
+}
+
 async function deliverPendingDropAlerts(env, limit = 20) {
   const alerts = await getPendingInventoryDropAlerts(env.DB, limit);
   for (const alert of alerts) {
@@ -368,6 +420,26 @@ async function deliverPendingDropAlerts(env, limit = 20) {
       await markInventoryDropAlertFailed(env.DB, alert.id, error.message,
         new Date(Date.now() + retryMs).toISOString());
       console.error(`[DROP WATCH] Alert delivery failed for event ${alert.event_id}: ${error.message}`);
+    }
+  }
+  return alerts.length;
+}
+
+async function deliverPendingCandidateAlerts(env, limit = 10) {
+  const alerts = await getPendingInventoryCandidateAlerts(env.DB, limit);
+  for (const alert of alerts) {
+    let payload = {};
+    try { payload = JSON.parse(alert.payload_json || '{}'); } catch { payload = {}; }
+    try {
+      await postNotification(env.NOTIFICATION_OUTBOUND_URL, buildCandidateAlertMessage(payload));
+      await markInventoryCandidateAlertDelivered(env.DB, alert.id, new Date().toISOString());
+      console.log(`[CANDIDATE ALERT] Delivered for event ${alert.event_id}.`);
+    } catch (error) {
+      const attempt = Number(alert.attempt_count || 0) + 1;
+      const retryMs = Math.min(30 * 60 * 1000, 60 * 1000 * (2 ** Math.min(attempt, 5)));
+      await markInventoryCandidateAlertFailed(env.DB, alert.id, error.message,
+        new Date(Date.now() + retryMs).toISOString());
+      console.error(`[CANDIDATE ALERT] Delivery failed for event ${alert.event_id}: ${error.message}`);
     }
   }
   return alerts.length;
@@ -467,6 +539,17 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
       }
       lastResult = result;
 
+      // SeatMe sometimes returns its human-validation HTML with a 200 status.
+      // It is neither inventory nor a recoverable parser error: stop this
+      // venue cleanly so a later invocation can resume from its checkpoint.
+      if (isVenueValidationResponse(result)) {
+        const error = new Error(`Venue validation challenge received from ${targetUrlString}.`);
+        error.code = 'VENUE_VALIDATION_CHALLENGE';
+        error.endpointUrl = targetUrlString;
+        error.provider = providerName;
+        throw error;
+      }
+
       // A proxy error must not prevent the configured fallback provider from
       // attempting the request. Target responses such as NotOnSale are still
       // normal 2xx responses and return immediately.
@@ -479,6 +562,7 @@ async function executeSecureFetch(env, targetUrlString, targetRow, fetchOptions 
       return result;
     } catch (err) {
       if (err?.code === 'SUBREQUEST_BUDGET_EXHAUSTED') throw err;
+      if (err?.code === 'VENUE_VALIDATION_CHALLENGE') throw err;
       console.error(`[PROVIDER POOL] Provider ${providerName} threw an exception: ${err.message}. Attempting next provider.`);
       lastResult = { status: 500, text: err.message, routedVia: providerName };
     }
@@ -499,6 +583,19 @@ function consumeExternalRequestBudget(requestBudget, requestLabel) {
   requestBudget.remaining -= 1;
 }
 
+export function isSubrequestBudgetExhaustion(error) {
+  return error?.code === 'SUBREQUEST_BUDGET_EXHAUSTED'
+    || /subrequest budget exhausted/i.test(String(error?.message || error || ''));
+}
+
+export function isVenueValidationChallenge(error) {
+  return error?.code === 'VENUE_VALIDATION_CHALLENGE';
+}
+
+// The bounded session smoke test retains only cookies issued during the same
+// Worker invocation. It never accepts a client cookie, emits values in a
+// response/log, or persists state. Cookie retention beyond this test requires
+// a separately reviewed encrypted session store.
 async function executeScanForTarget(targetRow, env, ctx, options = {}) {
   const scanStartedAtMs = Date.now();
   const { now, jitterMin, jitterMax, runParser, logPrefix = '[SCAN]', adapter: suppliedAdapter, skipJitter = false } = options;
@@ -591,9 +688,9 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
     const boundDebugLog = (message, level) => debugLogAndNotify(env, ctx, message, level);
     const boundApiFetch = (url, opts) => executeApiFetch(url, { ...opts, debugLog: boundDebugLog });
 
-    const secureFetchForScan = (fetchEnv, url, row, fetchOptions = {}) => executeSecureFetch(fetchEnv, url, row, {
+    const rawSecureFetchForScan = (fetchEnv, url, row, fetchOptions = {}) => executeSecureFetch(fetchEnv, url, row, {
       ...fetchOptions,
-      providerPool: fetchOptions.apiRequest ? adapter.apiFetchProviderPool : adapter.fetchProviderPool,
+      providerPool: fetchOptions.providerPool || (fetchOptions.apiRequest ? adapter.apiFetchProviderPool : adapter.fetchProviderPool),
       requestBudget: fetchOptions.requestBudget || options.requestBudget,
       // Endpoint rows are intentionally opt-in diagnostics. Redirect handling
       // itself is always enabled, but normal production scans do not write one
@@ -603,29 +700,81 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
           const isRedirect = Number(result?.status) >= 300 && Number(result?.status) < 400;
           const contentType = result?.contentType || null;
           const isJsonContent = !contentType || /(?:application|text)\/json/i.test(contentType);
+          const isValidationChallenge = isVenueValidationResponse(result);
           await recordInventoryEndpointTelemetry(env.DB, {
             id: buildWorkerLogId(), eventId: targetRow.event_id, venueId: targetRow.venue_id,
             inventoryJobId: options.inventoryJobId, endpointType: fetchOptions.inventoryEndpoint,
             provider: result?.routedVia, httpStatus: result?.status, contentType,
             redirectDetected: isRedirect,
-            outcome: isRedirect ? 'redirect'
+            outcome: isValidationChallenge ? 'venue_validation_challenge'
+              : (isRedirect ? 'redirect'
               : (!isJsonContent ? 'unexpected_content_type'
-                : (Number(result?.status) >= 200 && Number(result?.status) < 300 ? 'success' : 'http_error')),
+                : (Number(result?.status) >= 200 && Number(result?.status) < 300 ? 'success' : 'http_error'))),
             durationMs
           });
         }
         : fetchOptions.onFetchResult
     });
+    const apiProviderPool = Array.isArray(adapter.apiFetchProviderPool) ? adapter.apiFetchProviderPool : [];
+    const sessionBootstrapEnabled = adapter.sessionBootstrapEnabled === true
+      && apiProviderPool.length === 1
+      && apiProviderPool[0] === 'native';
+    const sessionTtlMs = Math.max(60_000, Number(adapter.sessionTtlMinutes) || 15) * 60_000;
+    let sessionCookieHeader = sessionBootstrapEnabled
+      ? await loadVenueSessionCookieHeader(env.DB, env, targetRow.venue_id)
+      : '';
+    const persistSessionCookies = async result => {
+      const issuedHeader = mergeCookieHeaders(result?.setCookies ? result.setCookies.map(cookie => String(cookie).split(';', 1)[0]).join('; ') : '');
+      if (!issuedHeader) return;
+      sessionCookieHeader = mergeCookieHeaders(sessionCookieHeader, issuedHeader);
+      await saveVenueSessionCookieHeader(env.DB, env, targetRow.venue_id, sessionCookieHeader, sessionTtlMs);
+    };
+    const secureFetchForScan = async (fetchEnv, url, row, fetchOptions = {}) => {
+      const managesSession = sessionBootstrapEnabled
+        && fetchOptions.apiRequest === true
+        && url.startsWith('https://seatme.scfta.org/api/');
+      if (!managesSession) return rawSecureFetchForScan(fetchEnv, url, row, fetchOptions);
+
+      const requestHeaders = {
+        ...sessionRequestHeaders(),
+        ...(fetchOptions.headers || {}),
+        ...(sessionCookieHeader ? { Cookie: sessionCookieHeader } : {})
+      };
+      const initial = await rawSecureFetchForScan(fetchEnv, url, row, { ...fetchOptions, headers: requestHeaders });
+      await persistSessionCookies(initial);
+      if (!isSessionRedirectResponse(initial)) return initial;
+
+      const cartBootstrapUrl = `https://www.scfta.org/cart/updatecart?returnurl=${encodeURIComponent(url)}`;
+      const bootstrap = await rawSecureFetchForScan(fetchEnv, cartBootstrapUrl, row, {
+        method: 'GET', providerPool: ['native'], redirect: 'manual', headers: sessionRequestHeaders()
+      });
+      await persistSessionCookies(bootstrap);
+      if (!sessionCookieHeader) return initial;
+
+      console.log(`[VENUE SESSION] Refreshed ${targetRow.venue_id} session after SeatMe redirect; retrying endpoint once.`);
+      const retry = await rawSecureFetchForScan(fetchEnv, url, row, {
+        ...fetchOptions,
+        headers: { ...sessionRequestHeaders(), ...(fetchOptions.headers || {}), Cookie: sessionCookieHeader }
+      });
+      await persistSessionCookies(retry);
+      return retry;
+    };
     const inventory = await effectiveStrategy(targetRow, htmlBody, env, ctx, secureFetchForScan, trackWorkerLog, adapter, boundApiFetch);
     const scanDurationMs = Date.now() - scanStartedAtMs;
+    const availabilityMetadata = inventory?.scanMetadata || null;
+    const availabilityOnly = Boolean(availabilityMetadata?.availabilityOnly);
     let inventoryCandidates = [];
-    let inventoryCandidatePolicy = 'not_applied_position_policy_not_not_applicable';
+    let inventoryCandidatePolicy = availabilityOnly
+      ? 'not_applied_availability_only'
+      : 'not_applied_position_policy_not_not_applicable';
     let confirmedDropDetected = false;
     console.log(`[PARSER] Parser for ${targetRow.venue_id} found ${inventory.length} item(s).`);
 
     if (!isDiscovery) {
       const timestampIsoString = new Date().toISOString();
-      const snapshotHash = computeStringHash(JSON.stringify(inventory));
+      const snapshotHash = availabilityOnly
+        ? computeStringHash(availabilityMetadata.availabilityFingerprint || JSON.stringify(inventory))
+        : computeStringHash(JSON.stringify(inventory));
       const scanId = buildWorkerLogId();
       try {
         const targetQuantities = Array.isArray(options.targetQuantities)
@@ -634,7 +783,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
         const hallPolicy = targetRow.venue_hall_id
           ? await getHallInventoryPolicy(env.DB, targetRow.venue_hall_id)
           : null;
-        const canUseNotApplicableRowPolicy = isNotApplicableRowPolicy(hallPolicy);
+        const canUseNotApplicableRowPolicy = !availabilityOnly && isNotApplicableRowPolicy(hallPolicy);
         if (canUseNotApplicableRowPolicy) inventoryCandidatePolicy = 'not_applicable_same_or_forward_row';
         const rowOrdering = canUseNotApplicableRowPolicy
           ? await getHallRowOrdering(env.DB, targetRow.venue_hall_id)
@@ -645,24 +794,28 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
           ))
           : [];
         inventoryCandidates = candidates;
+        const observedAvailableItemCount = availabilityOnly
+          ? Math.max(0, Number(availabilityMetadata.availableItemCount) || 0)
+          : inventory.length;
         const persistedSnapshot = await persistInventoryCandidates(env.DB, {
           scanId,
           eventId: targetRow.event_id,
           venueId: targetRow.venue_id,
-          scanSource: options.scanSource || (logPrefix === '[SINGLE EVENT INVENTORY]' ? 'single_event_inventory' : 'scheduled_inventory'),
+          scanSource: availabilityOnly
+            ? 'availability_poll'
+            : (options.scanSource || (logPrefix === '[SINGLE EVENT INVENTORY]' ? 'single_event_inventory' : 'scheduled_inventory')),
           scannedAt: timestampIsoString,
           snapshotHash,
-          availableItemCount: inventory.length,
+          availableItemCount: observedAvailableItemCount,
           inventoryJobId: options.inventoryJobId || null,
           durationMs: scanDurationMs,
           candidates
         });
         let dropObservation = null;
+        let candidateObservation = null;
         {
-          const maxPriceCents = Number.isFinite(Number(targetRow.drop_watch_max_price_cents))
-            ? Number(targetRow.drop_watch_max_price_cents)
-            : null;
-          const qualifyingInventory = filterInventoryForDropPriceRule(inventory, maxPriceCents);
+          const maxPriceCents = normalizeDropPriceCapCents(targetRow.drop_watch_max_price_cents);
+          const qualifyingInventory = availabilityOnly ? [] : filterInventoryForDropPriceRule(inventory, maxPriceCents);
           const qualifyingPrices = qualifyingInventory
             .map(item => Number(item.priceCents))
             .filter(Number.isFinite);
@@ -676,7 +829,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             showtime: targetRow.showtime,
             eventUrl: targetRow.event_url,
             availableItemCount: qualifyingInventory.length,
-            observedAvailableItemCount: inventory.length,
+            observedAvailableItemCount,
             maxPriceCents,
             lowestQualifyingPriceCents: qualifyingPrices.length ? Math.min(...qualifyingPrices) : null,
             highestQualifyingPriceCents: qualifyingPrices.length ? Math.max(...qualifyingPrices) : null,
@@ -693,31 +846,81 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             eventId: targetRow.event_id,
             scanId,
             alertId: `${scanId}:sold-out-drop`,
-            availableItemCount: qualifyingInventory.length,
+            // An availability-only poll is possible only after an available
+            // baseline with an identical fingerprint. Preserve that state
+            // instead of incorrectly treating its empty detail list as sold out.
+            availableItemCount: availabilityOnly ? observedAvailableItemCount : qualifyingInventory.length,
             observedAt: timestampIsoString,
+            availabilityFingerprint: availabilityMetadata?.availabilityFingerprint || null,
+            deepScanAt: availabilityOnly ? null : timestampIsoString,
             alertPayload: dropPayload
           });
           confirmedDropDetected = dropObservation.dropDetected;
-          console.log('[DROP WATCH] Availability state recorded', {
+          console.log('[INVENTORY STATE] Availability recorded', {
             eventId: targetRow.event_id,
             showName: targetRow.show_name,
             availabilityState: dropObservation.availabilityState,
-            availableItemCount: qualifyingInventory.length,
-            observedAvailableItemCount: inventory.length,
+            availableItemCount: availabilityOnly ? observedAvailableItemCount : qualifyingInventory.length,
+            observedAvailableItemCount,
             maxPriceCents,
             dropDetected: dropObservation.dropDetected
           });
+        }
+        if (!availabilityOnly) {
+          const candidateDigest = candidates
+            .slice()
+            .sort((left, right) => Number(left.priceCents) - Number(right.priceCents)
+              || Number(left.targetQuantity) - Number(right.targetQuantity)
+              || String(left.section).localeCompare(String(right.section))
+              || String(left.row).localeCompare(String(right.row))
+              || Number(left.startSeat) - Number(right.startSeat))
+            .slice(0, 3)
+            .map(candidate => ({
+              targetQuantity: candidate.targetQuantity,
+              section: candidate.section,
+              row: candidate.row,
+              startSeat: candidate.startSeat,
+              endSeat: candidate.endSeat,
+              priceCents: candidate.priceCents,
+              priceLevel: candidate.priceLevel,
+              seatQuality: candidate.seatQuality
+            }));
+          candidateObservation = await recordInventoryCandidateObservation(env.DB, {
+            eventId: targetRow.event_id,
+            scanId,
+            alertId: `${scanId}:candidate`,
+            candidateFingerprint: candidateDigest.length ? computeStringHash(JSON.stringify(candidateDigest)) : '',
+            observedAt: timestampIsoString,
+            alertPayload: {
+              venueName: targetRow.venue_name,
+              venueHall: targetRow.venue_hall,
+              showName: targetRow.show_name,
+              showtime: targetRow.showtime,
+              eventUrl: targetRow.event_url,
+              candidates: candidateDigest,
+              checkoutFeeRule: adapter.checkoutFeeRule,
+              observedAt: timestampIsoString
+            }
+          });
+          if (candidateObservation.candidateDetected) await deliverPendingCandidateAlerts(env, 1);
         }
         const logSummary = buildInventorySnapshotLogSummary(inventory);
         console.log('[D1 INVENTORY] Snapshot saved', {
           scanId,
           eventId: targetRow.event_id,
           venueId: targetRow.venue_id,
-          scanSource: options.scanSource || (logPrefix === '[SINGLE EVENT INVENTORY]' ? 'single_event_inventory' : 'scheduled_inventory'),
+          scanSource: availabilityOnly
+            ? 'availability_poll'
+            : (options.scanSource || (logPrefix === '[SINGLE EVENT INVENTORY]' ? 'single_event_inventory' : 'scheduled_inventory')),
           scannedAt: timestampIsoString,
           snapshotHash,
           durationMs: scanDurationMs,
           availableSeatRowsObserved: inventory.length,
+          availabilityOnly,
+          availabilityFingerprintHash: availabilityMetadata?.availabilityFingerprint
+            ? computeStringHash(availabilityMetadata.availabilityFingerprint)
+            : null,
+          availabilitySeatCount: observedAvailableItemCount,
           targetQuantities,
           requiredBufferBlockCount: adapter.inventoryBufferBlockCount,
           savedCandidateBlocks: persistedSnapshot.candidateCount,
@@ -725,7 +928,8 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
           sections: logSummary.sections,
           sampleObservedSeats: logSummary.sampleSavedSeats,
           sampleSavedCandidates: candidates.slice(0, 3),
-          dropDetected: dropObservation?.dropDetected || false
+          dropDetected: dropObservation?.dropDetected || false,
+          candidateAlertDetected: candidateObservation?.candidateDetected || false
         });
       } catch (snapshotError) {
         // A successful live scan must not be turned into a false parser failure
@@ -737,8 +941,8 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
           error: String(snapshotError)
         });
       }
-      await updateEventScanResult(env.DB, targetRow.event_id, snapshotHash, timestampIsoString);
-      console.log(`${logPrefix} Inventory scan succeeded: ${targetRow.show_name} (${targetRow.showtime}), ${inventory.length} item(s) parsed in ${scanDurationMs}ms.`);
+      if (!availabilityOnly) await updateEventScanResult(env.DB, targetRow.event_id, snapshotHash, timestampIsoString);
+      console.log(`${logPrefix} Inventory scan succeeded: ${targetRow.show_name} (${targetRow.showtime}), ${inventory.length} item(s) parsed in ${scanDurationMs}ms${availabilityOnly ? ' (availability-only poll)' : ''}.`);
     }
 
     if (targetRow.listing_row_id) {
@@ -793,6 +997,39 @@ Outcome: Seat, price, and confidence buffer all confirmed live. No action taken 
       durationMs: scanDurationMs
     };
   } catch (err) {
+    if (isVenueValidationChallenge(err)) {
+      const consecutiveBlocks = (backoffState?.consecutiveBlocks || 0) + 1;
+      const delayMs = computeBackoffDelayMs(consecutiveBlocks, adapter);
+      const backoffUntil = new Date(now.getTime() + delayMs).toISOString();
+      await setVenueBackoffState(env.DB, targetRow.venue_id, {
+        consecutiveBlocks,
+        backoffUntil,
+        lastStatus: 421,
+        reason: 'venue_validation_challenge',
+        endpointUrl: err.endpointUrl || null,
+        detectedAt: new Date().toISOString()
+      });
+      const message = `[VENUE VALIDATION] ${targetRow.venue_name || targetRow.venue_id} returned a human-validation page. Inventory is paused until ${backoffUntil}.\nShow: ${targetRow.show_name}\nEvent: ${targetRow.event_id}\nEndpoint: ${err.endpointUrl || 'unknown'}`;
+      console.warn(`${logPrefix} ${message}`);
+      await trackWorkerLog(env, ctx, 'warn', 'Venue validation challenge; inventory checkpoint preserved', {
+        venueId: targetRow.venue_id,
+        eventId: targetRow.event_id,
+        endpointUrl: err.endpointUrl || null,
+        backoffUntil,
+        consecutiveBlocks
+      });
+      // Exactly one alert is sent when the challenge is first detected. The
+      // persisted backoff prevents later events/invocations from sending it.
+      sendTelegramNotification(env, ctx, message, 'critical');
+      return { status: 'deferred', reason: 'venue_validation_challenge', durationMs: Date.now() - scanStartedAtMs };
+    }
+    if (isSubrequestBudgetExhaustion(err)) {
+      // This is an intentional, bounded yield rather than a failed SeatMe
+      // request. The all-events runner puts the event back at the front of
+      // its leased queue and retries it with a fresh invocation budget.
+      console.log(`${logPrefix} Request budget reached while scanning ${targetRow.event_id}; deferring this event to the next invocation.`);
+      return { status: 'deferred', reason: 'subrequest_budget_exhausted' };
+    }
     console.log(`${logPrefix} Background trace failed: ${err.message}`);
     await trackWorkerLog(env, ctx, 'error', 'Scan execution failed', { error: String(err), eventId: targetRow.event_id });
     return { status: 'failed', reason: err.message };
@@ -833,7 +1070,10 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
   const remainingEventIds = JSON.parse(job.remaining_event_ids_json || '[]');
   const eventById = new Map((await getUpcomingInventoryEvents(env.DB, adapter.venueId))
     .map(event => [event.event_id, event]));
-  const batchLimit = Math.min(adapter.inventoryBatchSize, remainingEventIds.length);
+  // Attempt as many events as are cheap enough to fit inside the shared
+  // request/time budget. `inventoryMaxEventsPerRun` is only a guardrail for
+  // pathological all-skip runs; it is deliberately not a fixed batch size.
+  const batchLimit = Math.min(adapter.inventoryMaxEventsPerRun, remainingEventIds.length);
   // Cloudflare permits 50 subrequests per invocation. Keep one request in
   // reserve and share the budget across every event in this batch.
   const requestBudget = { limit: adapter.inventoryExternalRequestBudget, remaining: adapter.inventoryExternalRequestBudget };
@@ -844,6 +1084,10 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
   const productionTimings = new Map();
 
   while (attempted < batchLimit && remainingEventIds.length && Date.now() < deadlineMs) {
+    if (requestBudget.remaining < 1) {
+      console.log(`[ALL EVENTS INVENTORY] External request budget reached; checkpointing ${remainingEventIds.length} unstarted event(s).`);
+      break;
+    }
     if (!isMonitoringWindowActive(new Date(), adapter.timezoneName, adapter.businessHours)) {
       const context = {
         scheduleMode: 'inventory_scan', venueId: adapter.venueId,
@@ -870,6 +1114,25 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
       inventoryJobId: job.id, scanSource: 'all_events_inventory',
       targetQuantities: adapter.inventoryTargetQuantities, requestBudget
     });
+    if (result.status === 'deferred' && ['subrequest_budget_exhausted', 'venue_validation_challenge'].includes(result.reason)) {
+      // The scan may have spent part of the budget before discovering that it
+      // cannot finish safely. Put this event back at the front so it gets a
+      // complete fresh attempt next invocation; never burn through the rest
+      // of the queue as artificial failures.
+      remainingEventIds.unshift(eventId);
+      attempted -= 1;
+      const reason = result.reason === 'venue_validation_challenge' ? 'Venue validation challenge' : 'Budget reached';
+      console.log(`[ALL EVENTS INVENTORY] ${reason} while scanning ${eventId}; event requeued for the next invocation.`);
+      break;
+    }
+    if (result.status === 'skipped' && result.reason === 'venue_backoff') {
+      // Preserve the queue during the cooldown. Treating every queued event
+      // as a skip would incorrectly complete the job without scanning it.
+      remainingEventIds.unshift(eventId);
+      attempted -= 1;
+      console.log(`[ALL EVENTS INVENTORY] Venue backoff is active; job checkpoint preserved for ${eventId}.`);
+      break;
+    }
     if (result.status === 'completed') completed += 1;
     else if (result.status === 'skipped') skipped += 1;
     else failed += 1;
@@ -900,17 +1163,37 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
   });
   if (!remainingEventIds.length) {
     await completeInventoryJob(env.DB, { ...checkpoint, completedAt: batchCompletedAt.toISOString() });
+    const jobElapsedMs = batchCompletedAt.getTime() - new Date(job.started_at).getTime();
+    console.log('[INVENTORY JOB TIMER] Complete', {
+      venueId: adapter.venueId,
+      jobId: job.id,
+      batchCount: batchNumber,
+      elapsedMs: jobElapsedMs,
+      elapsed: formatJobDuration(jobElapsedMs)
+    });
     console.log(`[ALL EVENTS INVENTORY] Job complete: ${job.total_event_count} events in ${batchNumber} batch(es), ${batchCompletedAt.getTime() - new Date(job.started_at).getTime()}ms total.`, {
       completed: completedEventCount, failed: failedEventCount, skipped: skippedEventCount,
       productions: Object.fromEntries(productionTimings)
     });
   } else {
     await checkpointInventoryJob(env.DB, checkpoint);
+    const jobElapsedMs = batchCompletedAt.getTime() - new Date(job.started_at).getTime();
+    console.log('[INVENTORY JOB TIMER] Progress', {
+      venueId: adapter.venueId,
+      jobId: job.id,
+      batchNumber,
+      elapsedMs: jobElapsedMs,
+      elapsed: formatJobDuration(jobElapsedMs),
+      completedEventCount,
+      totalEventCount: job.total_event_count,
+      remainingEventCount: remainingEventIds.length
+    });
     console.log('[ALL EVENTS INVENTORY] Batch checkpointed', {
       jobId: job.id, batchNumber, attempted, completed, failed, skipped,
       remaining: remainingEventIds.length, durationMs: batchCompletedAt.getTime() - batchStartedAt.getTime(),
       externalRequestsUsed: requestBudget.limit - requestBudget.remaining,
       externalRequestsRemaining: requestBudget.remaining,
+      inventoryMaxEventsPerRun: adapter.inventoryMaxEventsPerRun,
       productions: Object.fromEntries(productionTimings)
     });
   }
@@ -922,10 +1205,16 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
 // an alertable drop. Candidate blocks and resale buffer rules do not apply.
 async function runDropWatchForVenue(adapter, env, ctx, now) {
   const targets = await getDueDropWatchEvents(env.DB, adapter.venueId, adapter.dropWatchBatchSize,
-    adapter.automaticSoldOutIntervalMinutes);
+    adapter.dropWatchIntervalsMinutes);
   if (!targets.length) return { attempted: 0, completed: 0, failed: 0 };
 
-  console.log(`[DROP WATCH] ${adapter.venueName}: scanning ${targets.length} due high-priority performance(s).`);
+  console.log(`[DROP WATCH] ${adapter.venueName}: scanning ${targets.length} due performance(s).`, {
+    priorities: targets.reduce((counts, target) => {
+      const priority = target.drop_watch_priority || 'medium';
+      counts[priority] = (counts[priority] || 0) + 1;
+      return counts;
+    }, {})
+  });
   let completed = 0;
   let failed = 0;
   for (const targetRow of targets) {
@@ -936,6 +1225,11 @@ async function runDropWatchForVenue(adapter, env, ctx, now) {
       targetQuantities: adapter.inventoryTargetQuantities,
       dropWatch: true
     });
+    if ((result.status === 'deferred' && result.reason === 'venue_validation_challenge')
+      || (result.status === 'skipped' && result.reason === 'venue_backoff')) {
+      console.log('[DROP WATCH] Venue recovery cooldown active; remaining drop targets will resume later.');
+      break;
+    }
     if (result.status === 'completed') completed += 1;
     else failed += 1;
     if (result.dropDetected) await deliverPendingDropAlerts(env, 5);
@@ -1008,6 +1302,7 @@ export async function runScheduledCycle(env, ctx, options = {}) {
       await trackWorkerLog(env, ctx, 'info', 'High-priority sold-out drop-watch pass started', { scheduleMode });
       for (const adapter of runnableAdapters) {
         await deliverPendingDropAlerts(env, 20);
+        await deliverPendingCandidateAlerts(env, 10);
         await runDropWatchForVenue(adapter, env, ctx, now);
       }
       return;
@@ -1174,6 +1469,87 @@ export default {
         venue_id: adapter.venueId,
         ...result,
       }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Proves whether SeatMe issues enough state during an ordinary first GET
+    // for a same-invocation retry to return inventory. This is intentionally
+    // not a scheduler path and does not persist or disclose cookie values.
+    if (request.method === 'POST' && url.pathname === '/operations/session-smoke-test') {
+      if (!isRequestAuthorized(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      }
+      let payload;
+      try { payload = await request.json(); } catch {
+        return new Response(JSON.stringify({ error: 'Invalid JSON format' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const eventId = String(payload?.event_id || '').trim();
+      const bootstrapMode = String(payload?.bootstrap || 'availability').trim().toLowerCase();
+      if (!/^\d{1,20}$/.test(eventId)) {
+        return new Response(JSON.stringify({ error: 'event_id must be a numeric Tessitura performance ID' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (!['availability', 'settings', 'cart'].includes(bootstrapMode)) {
+        return new Response(JSON.stringify({ error: 'bootstrap must be availability, settings, or cart' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const [adapter] = await getWorkerScopedAdapters(env);
+      if (!adapter?.inventoryApiUrlPattern?.includes('{performanceId}')) {
+        return new Response(JSON.stringify({ error: 'This session smoke test is not implemented for the configured venue adapter' }), { status: 501, headers: { 'Content-Type': 'application/json' } });
+      }
+      const endpointUrl = adapter.inventoryApiUrlPattern.replace('{performanceId}', encodeURIComponent(eventId));
+      const settingsUrl = adapter.settingsApiUrlPattern?.replace('{performanceId}', encodeURIComponent(eventId));
+      const cartBootstrapUrl = `https://www.scfta.org/cart/updatecart?returnurl=${encodeURIComponent(endpointUrl)}`;
+      // Mirror the safe, non-secret parts of the user's successful Postman
+      // request. Host and Connection remain runtime-managed by Workers.
+      const ordinaryHeaders = {
+        'User-Agent': 'PostmanRuntime/7.43.0',
+        Accept: '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Postman-Token': crypto.randomUUID()
+      };
+      try {
+        const requestAvailability = requestHeaders => executeSecureFetch(env, endpointUrl, {
+          venue_id: adapter.venueId,
+          event_id: eventId
+        }, {
+          method: 'GET',
+          providerPool: ['native'],
+          headers: { ...ordinaryHeaders, ...requestHeaders }
+        });
+        const bootstrapUrl = bootstrapMode === 'settings' ? settingsUrl
+          : (bootstrapMode === 'cart' ? cartBootstrapUrl : null);
+        const sessionResult = bootstrapUrl
+          ? await runEphemeralBootstrapThenTarget({
+            bootstrapRequest: () => executeSecureFetch(env, bootstrapUrl, {
+              venue_id: adapter.venueId,
+              event_id: eventId
+            }, {
+              method: 'GET',
+              providerPool: ['native'],
+              headers: ordinaryHeaders,
+              redirect: bootstrapMode === 'cart' ? 'manual' : 'follow'
+            }),
+            targetRequest: requestAvailability
+          })
+          : await runEphemeralSessionBootstrap({
+          request: requestHeaders => executeSecureFetch(env, endpointUrl, {
+            venue_id: adapter.venueId,
+            event_id: eventId
+          }, {
+            method: 'GET',
+            providerPool: ['native'],
+            headers: { ...ordinaryHeaders, ...requestHeaders }
+          })
+          });
+        return new Response(JSON.stringify({
+          mode: 'ephemeral_session_smoke_test', bootstrap: bootstrapMode, event_id: eventId, endpoint: endpointUrl,
+          ...sessionResult
+        }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      } catch (error) {
+        return new Response(JSON.stringify({
+          mode: 'ephemeral_session_smoke_test', event_id: eventId,
+          resultKind: isVenueValidationChallenge(error) ? 'venue_validation_challenge' : 'request_failed',
+          error: error.message
+        }, null, 2), { status: isVenueValidationChallenge(error) ? 409 : 502, headers: { 'Content-Type': 'application/json' } });
+      }
     }
 
     if (request.method === 'POST' && (url.pathname === '/inventory/single-event' || url.pathname === '/inventory/test')) {
@@ -1544,7 +1920,7 @@ Outcome: Transaction blocked automatically before a ghost sale collision could o
       '*/5 * * * *': 'drop_watch',
       '7,17,27,37,47,57 * * * *': 'inventory_scan',
       '12,32,52 * * * *': 'listing_watch',
-      '3-58/5 * * * *': 'discovery_scan'
+      '3 * * * *': 'discovery_scan'
     };
     const forcedMode =
       productionCronModes[event?.cron] ||

@@ -3,7 +3,9 @@ export const CRON_SCHEDULE_CONFIG = {
   dropWatchMinutes: new Set([0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]),
   inventoryScanMinutes: new Set([7, 17, 27, 37, 47, 57]),
   listingWatchMinutes: new Set([12, 32, 52]),
-  discoveryScanMinutes: new Set([3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]),
+  // Discovery refreshes the catalog once per hour. Fast sold-out monitoring
+  // remains in the independent five-minute drop-watch lane.
+  discoveryScanMinutes: new Set([3]),
 };
 
 export const SCAN_JITTER_CONFIG = {

@@ -5,10 +5,16 @@ import {
   buildHumanReviewNotification,
   buildNotificationRequest,
   buildDropAlertMessage,
+  buildCandidateAlertMessage,
   filterInventoryForDropPriceRule,
+  isSubrequestBudgetExhaustion,
+  buildServerIssuedCookieHeader,
+  normalizeDropPriceCapCents,
   runScheduledCycle,
   default as worker,
 } from '../index.js';
+import { calculateCandidateCheckoutAmounts } from '../checkout-fees.js';
+import { mergeCookieHeaders, isSessionRedirectResponse } from '../session-manager.js';
 import {
   isMonitoringWindowActive,
   formatVenueLocalTime,
@@ -20,6 +26,7 @@ import {
   isBlockLikeStatus,
   computeBackoffDelayMs,
   isSkyboxListingEnabled,
+  isVenueValidationResponse,
 } from '../venue-logic.js';
 import {
   parseSegerstromInventoryDocument,
@@ -34,10 +41,13 @@ import {
   segerstromDrillDownStrategy,
   segerstromProductionDiscoveryStrategy,
   segerstromSingleProductionDiscovery,
+  buildAvailabilityFingerprint,
   resolveCalendarVenueHall,
   resolveVenueHall,
   classifyDiscoveryOutcome,
   getCurrentSoldOutPerformances,
+  getDiscoveryRecheckMs,
+  formatJobDuration,
   isProductionDueForDiscovery
 } from '../strategies.js';
 import {
@@ -47,6 +57,8 @@ import {
   upsertDiscoveredEvents,
   markDiscoveredSoldOutEvents,
   getHallInventoryPolicy,
+  getDueDropWatchEvents,
+  getPendingInventoryDropAlerts,
 } from '../database/queries.js';
 import { normalizeExternalId } from '../utils.js';
 import { getActiveVenueAdapters } from '../database/venue-runtime-config.js';
@@ -63,6 +75,30 @@ const TEST_ADAPTERS = [{
 const run = async () => {
   test('business window is open for Los Angeles during active hours', () => {
     assert.equal(isMonitoringWindowActive(new Date('2026-08-03T13:00:00-07:00'), 'America/Los_Angeles'), true);
+  });
+
+  test('SeatMe validation HTML is classified even when upstream returns HTTP 200', () => {
+    assert.equal(isVenueValidationResponse({
+      status: 200,
+      text: 'User validation required to continue. Validation needed due to the detection of invalid input from this client IP address, error code : 421'
+    }), true);
+    assert.equal(isVenueValidationResponse({ status: 200, text: '[{"sectionGroupId":"1"}]' }), false);
+    assert.equal(isVenueValidationResponse({ status: 200, text: '<html>ordinary maintenance page</html>' }), false);
+  });
+
+  test('same-invocation session smoke builds a cookie header only from server-issued cookie pairs', () => {
+    assert.equal(buildServerIssuedCookieHeader([
+      'TrueTickets_Session=abc; Path=/; HttpOnly',
+      'sessid=xyz; Secure',
+      'malformed-cookie'
+    ]), 'TrueTickets_Session=abc; sessid=xyz');
+  });
+
+  test('venue session merges refreshed cookies and recognizes SeatMe redirect masks', () => {
+    assert.equal(mergeCookieHeaders('sessid=old; alpha=1', 'sessid=new; beta=2'), 'sessid=new; alpha=1; beta=2');
+    assert.equal(isSessionRedirectResponse({ status: 303, text: '{}' }), true);
+    assert.equal(isSessionRedirectResponse({ status: 200, text: '{"redirectMask":"https://example.test"}' }), true);
+    assert.equal(isSessionRedirectResponse({ status: 200, text: '[]' }), false);
   });
 
   test('business window is closed before 7:30 AM local venue time', () => {
@@ -98,6 +134,39 @@ const run = async () => {
     assert.equal(isProductionDueForDiscovery(production, {
       'excluded-production': { outcome: 'unknown', nextCheckAt: 'not-a-date' }
     }, nowMs), true);
+  });
+
+  test('venue-configured on-sale discovery recheck interval is 60 minutes', () => {
+    assert.equal(getDiscoveryRecheckMs({ discoveryRecheckMinutes: { on_sale: 60 } }, 'on_sale'), 60 * 60 * 1000);
+    assert.equal(getDiscoveryRecheckMs({}, 'sold_out'), 60 * 60 * 1000);
+  });
+
+  test('drop watch uses venue-scoped priority intervals and selects critical events first', async () => {
+    let capturedSql = '';
+    let capturedValues = [];
+    const fakeDb = {
+      prepare(sql) {
+        capturedSql = sql;
+        return {
+          bind: (...values) => {
+            capturedValues = values;
+            return { all: async () => ({ results: [] }) };
+          }
+        };
+      }
+    };
+    await getDueDropWatchEvents(fakeDb, 'segerstrom_center', 20, {
+      critical: 5, high: 10, medium: 30, low: 60
+    });
+    assert.match(capturedSql, /wr\.venue_id = v\.id/);
+    assert.match(capturedSql, /COALESCE\(wr\.priority, 'medium'\)/);
+    assert.match(capturedSql, /WHEN 'critical' THEN 0/);
+    assert.deepEqual(capturedValues, ['segerstrom_center', 5, 10, 60, 30, 20]);
+  });
+
+  test('job runtime timers render comparable elapsed durations', () => {
+    assert.equal(formatJobDuration(321), '0s');
+    assert.equal(formatJobDuration(65_000), '1m 5s');
   });
 
   test('only future sold-out performances are enrolled for drop monitoring', () => {
@@ -294,6 +363,28 @@ const run = async () => {
     assert.deepEqual(qualifying.map(item => item.priceCents), [16999, 17000]);
   });
 
+  test('unbounded drop watch accepts every available inventory item regardless of price', () => {
+    const inventory = [
+      { priceCents: 16999 },
+      { priceCents: 17000 },
+      { priceCents: 17001 },
+      { priceCents: null }
+    ];
+    assert.deepEqual(filterInventoryForDropPriceRule(inventory, null), inventory);
+  });
+
+  test('an unbounded D1 drop-price rule remains unbounded in the scan path', () => {
+    assert.equal(normalizeDropPriceCapCents(null), null);
+    assert.equal(normalizeDropPriceCapCents(''), null);
+    assert.equal(normalizeDropPriceCapCents(17000), 17000);
+  });
+
+  test('the shared request cap is a resumable boundary rather than a SeatMe error', () => {
+    assert.equal(isSubrequestBudgetExhaustion({ code: 'SUBREQUEST_BUDGET_EXHAUSTED' }), true);
+    assert.equal(isSubrequestBudgetExhaustion(new Error('External subrequest budget exhausted before GET')), true);
+    assert.equal(isSubrequestBudgetExhaustion(new Error('section_availability returned redirect HTTP 303')), false);
+  });
+
   test('Telegram notifications use Telegram chat_id and text fields', () => {
     const request = buildNotificationRequest(
       'https://api.telegram.org/botREDACTED/sendMessage?chat_id=-123&text=',
@@ -321,6 +412,49 @@ const run = async () => {
     assert.match(message, /Buy: https:\/\/seatme\.scfta\.org\/single\?id=30586/);
   });
 
+  test('unbounded drop alerts describe the rule as any available price', () => {
+    const message = buildDropAlertMessage({ maxPriceCents: null });
+    assert.match(message, /Price rule: any available price/);
+    assert.doesNotMatch(message, /\$0\.00 or less/);
+  });
+
+  test('candidate alerts show target blocks but do not disclose buffer blocks', () => {
+    const message = buildCandidateAlertMessage({
+      venueName: 'Segerstrom Center for the Arts', venueHall: 'Segerstrom Hall',
+      showName: 'Example Show', showtime: '2026-09-01 19:30:00', eventUrl: 'https://seatme.example/event',
+      observedAt: '2026-08-22T00:00:00.000Z',
+      checkoutFeeRule: { type: 'percentage_per_ticket', rateBasisPoints: 1800 },
+      candidates: [{ targetQuantity: 2, section: 'Orchestra', row: 'D', startSeat: '10', endSeat: '11', priceCents: 12500, bufferBlocks: [{ row: 'C' }] }]
+    });
+    assert.match(message, /Qty 2: Orchestra, Row D, Seats 10–11 \(\$125\.00 \+ \$22\.50 fee = \$147\.50 each; \$295\.00 all-in total\)/);
+    assert.doesNotMatch(message, /buffer|Row C/i);
+  });
+
+  test('Segerstrom checkout fee rule rounds 18 percent per ticket', () => {
+    const first = calculateCandidateCheckoutAmounts(6271, 2, {
+      type: 'percentage_per_ticket', rateBasisPoints: 1800
+    });
+    const second = calculateCandidateCheckoutAmounts(20678, 1, {
+      type: 'percentage_per_ticket', rateBasisPoints: 1800
+    });
+    assert.deepEqual(first && {
+      fee: first.feePerTicketCents, allIn: first.allInPerTicketCents, total: first.allInTotalCents
+    }, { fee: 1129, allIn: 7400, total: 14800 });
+    assert.deepEqual(second && {
+      fee: second.feePerTicketCents, allIn: second.allInPerTicketCents, total: second.allInTotalCents
+    }, { fee: 3722, allIn: 24400, total: 24400 });
+  });
+
+  test('durable alert selection parses ISO timestamps instead of comparing them as text', async () => {
+    let capturedSql = '';
+    const fakeDb = { prepare(sql) {
+      capturedSql = sql;
+      return { bind: () => ({ all: async () => ({ results: [] }) }) };
+    } };
+    await getPendingInventoryDropAlerts(fakeDb, 5);
+    assert.match(capturedSql, /datetime\(next_attempt_at\) <= datetime\('now'\)/);
+  });
+
   test('listing watcher is selected at minute 12', () => {
     const date = new Date(Date.UTC(2026, 7, 3, 0, 12, 0));
     assert.equal(getScheduleModeForCronDate(date), 'listing_watch');
@@ -329,6 +463,11 @@ const run = async () => {
   test('discovery scan is selected at minute 3', () => {
     const date = new Date(Date.UTC(2026, 7, 3, 0, 3, 0));
     assert.equal(getScheduleModeForCronDate(date), 'discovery_scan');
+  });
+
+  test('discovery scan is not selected between hourly :03 runs', () => {
+    const date = new Date(Date.UTC(2026, 7, 3, 0, 8, 0));
+    assert.equal(getScheduleModeForCronDate(date), 'idle');
   });
 
   test('monitoring-only mode blocks outbound Skybox approval requests', async () => {
@@ -630,6 +769,37 @@ const run = async () => {
     assert.deepEqual(apiRequests, ['https://seatme.scfta.org/api/sectionAvailability/performance/30589']);
   });
 
+  test('Segerstrom inventory uses one availability request for an unchanged available performance', async () => {
+    const targetRow = {
+      venue_id: 'segerstrom_center',
+      event_url: 'https://seatme.scfta.org/single?id=30589',
+      event_id: '30589',
+      inventory_availability_state: 'available'
+    };
+    const availability = [{
+      sectionGroupId: '1', sectionGroupName: 'Orchestra', totalAvailableSeats: 12,
+      sectionSeatSummaries: [{ sectionId: 1, zoneId: 9050, screenId: 1, availableCount: 12 }]
+    }];
+    targetRow.last_availability_fingerprint = buildAvailabilityFingerprint(availability);
+    const adapter = {
+      performanceIdParam: 'id',
+      inventoryApiUrlPattern: 'https://seatme.scfta.org/api/sectionAvailability/performance/{performanceId}',
+      priceApiUrlPattern: 'https://seatme.scfta.org/api/pricing/performance/{performanceId}',
+      seatInfoApiUrlPattern: 'https://seatme.scfta.org/api/seatinfo/sectiongroup?groupId={groupId}&performanceId={performanceId}'
+    };
+    const apiRequests = [];
+    const result = await segerstromDrillDownStrategy(targetRow, '', {}, {}, async (_env, url) => {
+      apiRequests.push(url);
+      return { text: JSON.stringify(availability), status: 200 };
+    }, () => {}, adapter);
+
+    assert.deepEqual(result, []);
+    assert.equal(result.scanMetadata.availabilityOnly, true);
+    assert.equal(result.scanMetadata.availabilityState, 'available');
+    assert.equal(result.scanMetadata.availableItemCount, 12);
+    assert.deepEqual(apiRequests, ['https://seatme.scfta.org/api/sectionAvailability/performance/30589']);
+  });
+
   test('Segerstrom drill-down uses settings only when availability omits a section name', async () => {
     const targetRow = { venue_id: 'segerstrom_center', event_url: 'https://seatme.scfta.org/single?id=30589' };
     const adapter = {
@@ -744,7 +914,7 @@ const run = async () => {
     }]);
     assert.ok(statements.some(statement => statement.sql.includes('INSERT OR IGNORE INTO venue_halls')));
     const eventInsert = statements.find(statement => statement.sql.includes('INSERT OR IGNORE INTO events'));
-    assert.equal(eventInsert.values.at(-1), 'segerstrom_center:hall:samueli%20theater');
+    assert.equal(eventInsert.values[5], 'segerstrom_center:hall:samueli%20theater');
   });
 
   test('discovery upsert chunks large event existence lookups below D1 bind limits', async () => {

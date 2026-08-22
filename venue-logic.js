@@ -113,6 +113,16 @@ export function getScheduleModeForCronDate(date = new Date()) {
 
 const BLOCK_LIKE_STATUS_CODES = new Set([403, 429, 503]);
 
+// Some upstream bot-validation pages are incorrectly returned with HTTP 200.
+// Classify only the provider's explicit validation markers; ordinary HTML or a
+// JSON parse failure must never be treated as a venue-wide block.
+export function isVenueValidationResponse(response = {}) {
+  const body = String(response?.text || '').toLowerCase();
+  return body.includes('user validation required to continue')
+    || body.includes('validation needed due to the detection of invalid input from this client ip')
+    || (body.includes('error code : 421') && body.includes('javascript and cookie support'));
+}
+
 export function isBlockLikeStatus(statusCode) {
   return BLOCK_LIKE_STATUS_CODES.has(Number(statusCode));
 }

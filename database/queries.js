@@ -66,8 +66,16 @@ export async function recordDiscoveryBatchMetric(db, metric) {
 }
 
 const GET_NEXT_EVENT_TO_SCAN_SQL = `
-  SELECT e.id as event_id, e.showtime, e.event_url, e.venue_hall, e.venue_hall_id, s.show_name, v.id as venue_id, v.name as venue_name, v.state_code, v.timezone_name, v.security_tier
-  FROM events e JOIN shows s ON e.show_id = s.id JOIN venues v ON s.venue_id = v.id
+  SELECT e.id as event_id, e.showtime, e.event_url, e.venue_hall, e.venue_hall_id,
+    s.show_name, v.id as venue_id, v.name as venue_name, v.state_code, v.timezone_name, v.security_tier,
+    eis.availability_state AS inventory_availability_state,
+    eis.availability_fingerprint AS last_availability_fingerprint,
+    eis.last_availability_checked_at,
+    eis.last_deep_scan_at
+  FROM events e
+  JOIN shows s ON e.show_id = s.id
+  JOIN venues v ON s.venue_id = v.id
+  LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
 `;
 
 export function getNextEventWithActiveListing(db, activeVenueIds = []) {
@@ -90,7 +98,9 @@ export function getNextUpcomingEvent(db, activeVenueIds = []) {
   const placeholders = activeVenueIds.map(() => '?').join(', ');
   const sql = `${GET_NEXT_EVENT_TO_SCAN_SQL}
     WHERE v.id IN (${placeholders})
-    AND e.showtime >= datetime('now') ORDER BY e.last_scanned_at ASC LIMIT 1`;
+    AND e.showtime >= datetime('now')
+    AND e.discovery_outcome IN ('on_sale', 'sold_out')
+    ORDER BY e.last_scanned_at ASC LIMIT 1`;
   return db.prepare(sql).bind(...activeVenueIds).first();
 }
 
@@ -103,6 +113,7 @@ export function getUpcomingEventById(db, eventId, activeVenueIds = []) {
     WHERE e.id = ?
     AND v.id IN (${placeholders})
     AND e.showtime >= datetime('now')
+    AND e.discovery_outcome IN ('on_sale', 'sold_out')
     LIMIT 1`;
   return db.prepare(sql).bind(eventId, ...activeVenueIds).first();
 }
@@ -156,28 +167,40 @@ export async function persistInventoryCandidates(db, snapshot = {}) {
   return { scanId: snapshot.scanId, candidateCount: candidates.length };
 }
 
-// A watch rule is a control-plane instruction, not a hard-coded title. A
-// performance is due when it has never been observed or its rule interval has
-// elapsed. Confirmed sold-out performances are deliberately selected first.
-export async function getDueDropWatchEvents(db, venueId, limit = 6, automaticSoldOutIntervalMinutes = 20) {
+// A watch rule is a venue-scoped control-plane instruction, not a hard-coded
+// title. A performance is due only while discovery still classifies it as
+// sold out and its configured priority interval has elapsed.
+export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityIntervals = {}) {
+  const intervals = {
+    critical: Math.max(5, Number(priorityIntervals.critical) || 5),
+    high: Math.max(5, Number(priorityIntervals.high) || 10),
+    medium: Math.max(5, Number(priorityIntervals.medium) || 30),
+    low: Math.max(5, Number(priorityIntervals.low) || 60)
+  };
   const result = await db.prepare(`SELECT e.id as event_id, e.showtime, e.event_url, e.venue_hall, e.venue_hall_id,
       s.show_name, v.id as venue_id, v.name as venue_name, v.state_code, v.timezone_name, v.security_tier,
-      wr.max_price_cents AS drop_watch_max_price_cents
+      wr.max_price_cents AS drop_watch_max_price_cents,
+      COALESCE(wr.priority, 'medium') AS drop_watch_priority,
+      eis.availability_state AS inventory_availability_state,
+      eis.availability_fingerprint AS last_availability_fingerprint,
+      eis.last_availability_checked_at,
+      eis.last_deep_scan_at
     FROM events e JOIN shows s ON e.show_id = s.id JOIN venues v ON s.venue_id = v.id
     LEFT JOIN inventory_watch_rules wr
       ON wr.venue_id = v.id AND wr.show_name = s.show_name AND wr.enabled = 1
     LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
     WHERE v.id = ? AND e.showtime >= datetime('now')
+      AND e.discovery_outcome = 'sold_out'
       AND (
-        (wr.id IS NOT NULL AND (eis.last_observed_at IS NULL
-          OR datetime(eis.last_observed_at, '+' || wr.scan_interval_minutes || ' minutes') <= datetime('now')))
-        OR (eis.availability_state = 'sold_out'
-          AND datetime(eis.last_observed_at, '+' || ? || ' minutes') <= datetime('now'))
+        eis.availability_state = 'sold_out' AND (eis.last_observed_at IS NULL
+          OR datetime(eis.last_observed_at, '+' || CASE COALESCE(wr.priority, 'medium')
+            WHEN 'critical' THEN ? WHEN 'high' THEN ? WHEN 'low' THEN ? ELSE ? END || ' minutes') <= datetime('now'))
       )
-    ORDER BY CASE WHEN eis.availability_state = 'sold_out' THEN 0 WHEN wr.id IS NOT NULL THEN 1 ELSE 2 END,
+    ORDER BY CASE COALESCE(wr.priority, 'medium')
+      WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
       eis.last_observed_at ASC, e.showtime ASC
-    LIMIT ?`).bind(venueId, Math.max(1, Math.min(120, Number(automaticSoldOutIntervalMinutes) || 20)),
-      Math.max(1, Math.min(20, Number(limit) || 6))).all();
+    LIMIT ?`).bind(venueId, intervals.critical, intervals.high, intervals.low, intervals.medium,
+      Math.max(1, Math.min(48, Number(limit) || 6))).all();
   return result?.results || [];
 }
 
@@ -201,16 +224,21 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
         observation.observedAt, observation.observedAt, observation.observedAt,
         observation.eventId, availableItemCount),
     db.prepare(`INSERT INTO event_inventory_state (
-      event_id, availability_state, available_item_count, last_scan_id, last_observed_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      event_id, availability_state, available_item_count, last_scan_id, last_observed_at,
+      availability_fingerprint, last_availability_checked_at, last_deep_scan_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_id) DO UPDATE SET
       availability_state = excluded.availability_state,
       available_item_count = excluded.available_item_count,
       last_scan_id = excluded.last_scan_id,
       last_observed_at = excluded.last_observed_at,
+      availability_fingerprint = excluded.availability_fingerprint,
+      last_availability_checked_at = excluded.last_availability_checked_at,
+      last_deep_scan_at = COALESCE(excluded.last_deep_scan_at, event_inventory_state.last_deep_scan_at),
       updated_at = excluded.updated_at`)
       .bind(observation.eventId, nextState, availableItemCount, observation.scanId,
-        observation.observedAt, observation.observedAt)
+        observation.observedAt, observation.availabilityFingerprint || null,
+        observation.observedAt, observation.deepScanAt || null, observation.observedAt)
   ];
   const results = await db.batch(statements);
   const inserted = results?.[0]?.meta?.changes ?? results?.[0]?.changes ?? 0;
@@ -220,7 +248,7 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
 export async function getPendingInventoryDropAlerts(db, limit = 20) {
   const result = await db.prepare(`SELECT * FROM inventory_drop_alerts
     WHERE status IN ('pending', 'failed')
-      AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))
+      AND (next_attempt_at IS NULL OR datetime(next_attempt_at) <= datetime('now'))
     ORDER BY created_at ASC LIMIT ?`).bind(Math.max(1, Math.min(50, Number(limit) || 20))).all();
   return result?.results || [];
 }
@@ -237,9 +265,66 @@ export function markInventoryDropAlertFailed(db, alertId, error, nextAttemptAt) 
     .bind(String(error || 'delivery failed').slice(0, 500), nextAttemptAt, new Date().toISOString(), alertId).run();
 }
 
+// A candidate alert is created only when the actionable candidate digest for an
+// event changes. If no candidates remain, pending alerts are made obsolete so
+// an old opportunity cannot be delivered after a later scan disproves it.
+export async function recordInventoryCandidateObservation(db, observation = {}) {
+  if (!db || !observation.eventId || !observation.scanId || !observation.observedAt) return { candidateDetected: false };
+  const fingerprint = String(observation.candidateFingerprint || '');
+  const state = await db.prepare(`SELECT candidate_fingerprint, active
+    FROM inventory_candidate_alert_state WHERE event_id = ?`).bind(observation.eventId).first();
+  const hasCandidates = Boolean(fingerprint);
+  const changed = hasCandidates && (Number(state?.active) !== 1 || state?.candidate_fingerprint !== fingerprint);
+  const statements = [];
+  if (!hasCandidates) {
+    statements.push(db.prepare(`UPDATE inventory_candidate_alerts SET status = 'obsolete', updated_at = ?
+      WHERE event_id = ? AND status IN ('pending', 'failed')`).bind(observation.observedAt, observation.eventId));
+  } else if (changed) {
+    statements.push(db.prepare(`UPDATE inventory_candidate_alerts SET status = 'obsolete', updated_at = ?
+      WHERE event_id = ? AND status IN ('pending', 'failed')`).bind(observation.observedAt, observation.eventId));
+    statements.push(db.prepare(`INSERT INTO inventory_candidate_alerts (
+      id, event_id, scan_id, status, payload_json, next_attempt_at, created_at, updated_at
+    ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`)
+      .bind(observation.alertId || `${observation.scanId}:candidate`, observation.eventId, observation.scanId,
+        JSON.stringify(observation.alertPayload || {}), observation.observedAt, observation.observedAt, observation.observedAt));
+  }
+  statements.push(db.prepare(`INSERT INTO inventory_candidate_alert_state (
+    event_id, candidate_fingerprint, active, updated_at
+  ) VALUES (?, ?, ?, ?)
+  ON CONFLICT(event_id) DO UPDATE SET
+    candidate_fingerprint = excluded.candidate_fingerprint,
+    active = excluded.active,
+    updated_at = excluded.updated_at`)
+    .bind(observation.eventId, hasCandidates ? fingerprint : null, hasCandidates ? 1 : 0, observation.observedAt));
+  await db.batch(statements);
+  return { candidateDetected: changed, alertId: changed ? (observation.alertId || `${observation.scanId}:candidate`) : null };
+}
+
+export async function getPendingInventoryCandidateAlerts(db, limit = 20) {
+  const result = await db.prepare(`SELECT * FROM inventory_candidate_alerts
+    WHERE status IN ('pending', 'failed')
+      AND (next_attempt_at IS NULL OR datetime(next_attempt_at) <= datetime('now'))
+    ORDER BY created_at ASC LIMIT ?`).bind(Math.max(1, Math.min(50, Number(limit) || 20))).all();
+  return result?.results || [];
+}
+
+export function markInventoryCandidateAlertDelivered(db, alertId, deliveredAt) {
+  return db.prepare(`UPDATE inventory_candidate_alerts SET status = 'delivered', attempt_count = attempt_count + 1,
+    delivered_at = ?, last_error = NULL, updated_at = ? WHERE id = ?`)
+    .bind(deliveredAt, deliveredAt, alertId).run();
+}
+
+export function markInventoryCandidateAlertFailed(db, alertId, error, nextAttemptAt) {
+  return db.prepare(`UPDATE inventory_candidate_alerts SET status = 'failed', attempt_count = attempt_count + 1,
+    last_error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`)
+    .bind(String(error || 'delivery failed').slice(0, 500), nextAttemptAt, new Date().toISOString(), alertId).run();
+}
+
 export async function getUpcomingInventoryEvents(db, venueId) {
   const result = await db.prepare(`${GET_NEXT_EVENT_TO_SCAN_SQL}
-    WHERE v.id = ? AND e.showtime >= datetime('now') ORDER BY e.showtime ASC`).bind(venueId).all();
+    WHERE v.id = ? AND e.showtime >= datetime('now')
+      AND e.discovery_outcome IN ('on_sale', 'sold_out')
+    ORDER BY e.showtime ASC`).bind(venueId).all();
   return result?.results || [];
 }
 
@@ -427,6 +512,22 @@ export async function markDiscoveredSoldOutEvents(db, eventIds = [], observedAt)
   return uniqueEventIds.length;
 }
 
+export async function recordDiscoveredEventOutcomes(db, observations = [], observedAt) {
+  const checkedAt = observedAt || new Date().toISOString();
+  const allowed = new Set(['on_sale', 'sold_out', 'past', 'not_on_sale', 'free_no_tickets', 'unknown']);
+  const unique = new Map();
+  for (const observation of observations) {
+    const eventId = normalizeExternalId(observation?.eventId);
+    const outcome = String(observation?.outcome || 'unknown');
+    if (eventId && allowed.has(outcome)) unique.set(eventId, { eventId, outcome, sourceProductionId: observation?.sourceProductionId || null });
+  }
+  if (!unique.size) return 0;
+  const results = await db.batch([...unique.values()].map(({ eventId, outcome, sourceProductionId }) => db.prepare(`UPDATE events
+    SET source_production_id = COALESCE(?, source_production_id), discovery_outcome = ?, discovery_status_checked_at = ?
+    WHERE id = ?`).bind(sourceProductionId, outcome, checkedAt, eventId)));
+  return results.reduce((total, result) => total + (result?.meta?.changes ?? result?.changes ?? 0), 0);
+}
+
 // Discovery checkpoints are stored as JSON in system_state. Use a separate,
 // compare-and-set lease key so an overlapping cron cannot read the same queue
 // and process the same production batch twice. A cancelled Worker naturally
@@ -507,7 +608,7 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
     for (let offset = 0; offset < eventIds.length; offset += EVENT_LOOKUP_CHUNK_SIZE) {
       const eventIdChunk = eventIds.slice(offset, offset + EVENT_LOOKUP_CHUNK_SIZE);
       const placeholders = eventIdChunk.map(() => '?').join(', ');
-      const sql = `SELECT id, showtime, event_url, venue_hall, venue_hall_id FROM events WHERE id IN (${placeholders})`;
+      const sql = `SELECT id, showtime, event_url, venue_hall, venue_hall_id, source_production_id, discovery_outcome FROM events WHERE id IN (${placeholders})`;
       const existingRows = await db.prepare(sql).bind(...eventIdChunk).all();
       for (const row of existingRows?.results || []) {
         existingEventMap.set(row.id, row);
@@ -561,14 +662,18 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
         const urlChanged = String(existing.event_url || '') !== String(eventUrl || '');
         const hallChanged = String(existing.venue_hall || '') !== String(venueHall || '');
         const hallIdChanged = String(existing.venue_hall_id || '') !== String(venueHallId || '');
+        const sourceProductionId = event.sourceProductionId || existing.source_production_id;
+        const discoveryOutcome = event.discoveryOutcome || existing.discovery_outcome || 'unknown';
+        const eligibilityChanged = String(existing.source_production_id || '') !== String(sourceProductionId || '')
+          || String(existing.discovery_outcome || '') !== String(discoveryOutcome || '');
 
-        if (showtimeChanged || urlChanged || hallChanged || hallIdChanged) {
+        if (showtimeChanged || urlChanged || hallChanged || hallIdChanged || eligibilityChanged) {
           const eventUpdateTarget = db.prepare(
-            'UPDATE events SET show_id = ?, showtime = ?, event_url = ?, venue_hall = ?, venue_hall_id = ? WHERE id = ?'
+            'UPDATE events SET show_id = ?, showtime = ?, event_url = ?, venue_hall = ?, venue_hall_id = ?, source_production_id = ?, discovery_outcome = ?, discovery_status_checked_at = ? WHERE id = ?'
           );
           statements.push({
             kind: 'event_update',
-            statement: eventUpdateTarget.bind(showId, showtime, eventUrl, venueHall || null, venueHallId, event.normalizedEventId)
+            statement: eventUpdateTarget.bind(showId, showtime, eventUrl, venueHall || null, venueHallId, sourceProductionId, discoveryOutcome, new Date().toISOString(), event.normalizedEventId)
           });
         }
         continue;
@@ -576,10 +681,10 @@ export async function upsertDiscoveredEvents(db, discoveredEvents = []) {
 
       // Conflict-safe even if a concurrent/retried discovery run inserts the
       // same performance after the existence lookup.
-      const eventInsert = db.prepare('INSERT OR IGNORE INTO events (id, show_id, showtime, event_url, venue_hall, venue_hall_id) VALUES (?, ?, ?, ?, ?, ?)');
+      const eventInsert = db.prepare('INSERT OR IGNORE INTO events (id, show_id, showtime, event_url, venue_hall, venue_hall_id, source_production_id, discovery_outcome, discovery_status_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
       statements.push({
         kind: 'event_insert',
-        statement: eventInsert.bind(event.normalizedEventId, showId, event.showtime, event.eventUrl, event.venueHall || null, event.venueHallId)
+        statement: eventInsert.bind(event.normalizedEventId, showId, event.showtime, event.eventUrl, event.venueHall || null, event.venueHallId, event.sourceProductionId || null, event.discoveryOutcome || 'unknown', new Date().toISOString())
       });
     }
   }

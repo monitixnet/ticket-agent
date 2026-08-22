@@ -1,6 +1,8 @@
 import { DISCOVERY_PAGE_LIMITS } from '../global-config.js';
+import { normalizeCheckoutFeeRule } from '../checkout-fees.js';
 
 const SECRET_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
+const DEFAULT_DROP_WATCH_INTERVALS_MINUTES = Object.freeze({ critical: 5, high: 10, medium: 30, low: 60 });
 
 function parseJson(value, fallback = {}) {
   try { return value ? JSON.parse(value) : fallback; } catch { return fallback; }
@@ -28,9 +30,14 @@ function buildAdapter(row, env) {
     && configuredBufferBlockCount >= 1 && configuredBufferBlockCount <= 5
     ? configuredBufferBlockCount
     : 2;
-  const inventoryBatchSize = Number.isInteger(Number(config.inventoryBatchSize))
-    ? Math.min(20, Math.max(1, Number(config.inventoryBatchSize)))
-    : 5;
+  // This is an event-attempt ceiling, not a fixed batch size. The shared
+  // request and runtime budgets remain the real safety limits. It lets cheap
+  // availability-only checks progress quickly without permitting a burst.
+  const inventoryMaxEventsPerRun = Number.isInteger(Number(config.inventoryMaxEventsPerRun))
+    ? Math.min(250, Math.max(1, Number(config.inventoryMaxEventsPerRun)))
+    : (Number.isInteger(Number(config.inventoryBatchSize))
+      ? Math.min(250, Math.max(1, Number(config.inventoryBatchSize)))
+      : 120);
   const inventoryMaxRunDurationMs = Number.isInteger(Number(config.inventoryMaxRunDurationMs))
     ? Math.min(120000, Math.max(10000, Number(config.inventoryMaxRunDurationMs)))
     : 45000;
@@ -38,16 +45,20 @@ function buildAdapter(row, env) {
     ? Math.min(49, Math.max(8, Number(config.inventoryExternalRequestBudget)))
     : 48;
   const dropWatchBatchSize = Number.isInteger(Number(config.dropWatchBatchSize))
-    ? Math.min(20, Math.max(1, Number(config.dropWatchBatchSize)))
+    ? Math.min(48, Math.max(1, Number(config.dropWatchBatchSize)))
     : 12;
-  const automaticSoldOutIntervalMinutes = Number.isInteger(Number(config.automaticSoldOutIntervalMinutes))
-    ? Math.min(120, Math.max(5, Number(config.automaticSoldOutIntervalMinutes)))
-    : 5;
+  const configuredDropWatchIntervals = config.dropWatchIntervalsMinutes || {};
+  const dropWatchIntervalsMinutes = Object.fromEntries(Object.entries(DEFAULT_DROP_WATCH_INTERVALS_MINUTES)
+    .map(([priority, defaultMinutes]) => {
+      const value = Number(configuredDropWatchIntervals[priority]);
+      return [priority, Number.isInteger(value) && value >= 5 && value <= 24 * 60 ? value : defaultMinutes];
+    }));
   const inventoryTargetQuantities = Array.isArray(config.inventoryTargetQuantities)
     ? [...new Set(config.inventoryTargetQuantities.map(Number).filter(value => Number.isInteger(value) && value >= 1 && value <= 10))]
     : [2, 6];
-  const providerPool = value => (Array.isArray(value) ? value : String(value || 'native').split(','))
-    .map(provider => String(provider).trim()).filter(Boolean);
+  // Native session-managed fetch is the sole approved egress path. Ignore
+  // legacy provider-pool values so a stale D1 record cannot re-enable a proxy.
+  const providerPool = () => ['native'];
 
   return {
     adapter: {
@@ -67,12 +78,13 @@ function buildAdapter(row, env) {
       baseIntervalMs: Number(config.baseIntervalMs) || 120000,
       maxIntervalMs: Number(config.maxIntervalMs) || 600000,
       inventoryBufferBlockCount,
-      inventoryBatchSize,
+      inventoryMaxEventsPerRun,
       inventoryMaxRunDurationMs,
       inventoryExternalRequestBudget,
       dropWatchBatchSize,
-      automaticSoldOutIntervalMinutes,
+      dropWatchIntervalsMinutes,
       inventoryTargetQuantities: inventoryTargetQuantities.length ? inventoryTargetQuantities : [2, 6]
+      ,checkoutFeeRule: normalizeCheckoutFeeRule(config.checkoutFeeRule)
       ,apiFetchProviderPool: providerPool(config.apiFetchProviderPool)
       ,fetchProviderPool: providerPool(config.fetchProviderPool)
       ,discoveryMaxPages: Math.max(1, Math.min(
@@ -123,11 +135,12 @@ export function buildPublicVenueSummary(adapter) {
     discoveryStrategy: adapter.discoveryStrategy,
     inventoryStrategy: adapter.inventoryStrategy,
     inventoryBufferBlockCount: adapter.inventoryBufferBlockCount,
-    inventoryBatchSize: adapter.inventoryBatchSize,
+    inventoryMaxEventsPerRun: adapter.inventoryMaxEventsPerRun,
     inventoryMaxRunDurationMs: adapter.inventoryMaxRunDurationMs,
     inventoryExternalRequestBudget: adapter.inventoryExternalRequestBudget,
     dropWatchBatchSize: adapter.dropWatchBatchSize,
-    automaticSoldOutIntervalMinutes: adapter.automaticSoldOutIntervalMinutes,
-    inventoryTargetQuantities: adapter.inventoryTargetQuantities
+    dropWatchIntervalsMinutes: adapter.dropWatchIntervalsMinutes,
+    inventoryTargetQuantities: adapter.inventoryTargetQuantities,
+    checkoutFeeRule: adapter.checkoutFeeRule
   };
 }

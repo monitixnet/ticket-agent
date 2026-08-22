@@ -1,5 +1,5 @@
 import { VENUE_PARSERS } from './venue-rules.js';
-import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, markDiscoveredSoldOutEvents, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
+import { upsertDiscoveredEvents, getDiscoveryJobState, setDiscoveryJobState, clearDiscoveryJobState, getDiscoveryProductionSchedule, setDiscoveryProductionSchedule, markDiscoveredSoldOutEvents, recordDiscoveredEventOutcomes, recordDiscoveryBatchMetric, claimDiscoveryJobLease, releaseDiscoveryJobLease } from './database/queries.js';
 import { delayExecution, normalizeExternalId, randomBetween } from './utils.js';
 import { isMonitoringWindowActive } from './venue-logic.js';
 import { DISCOVERY_PAGE_LIMITS } from './global-config.js';
@@ -7,13 +7,56 @@ import { DISCOVERY_PAGE_LIMITS } from './global-config.js';
 const DISCOVERY_OUTCOMES = ['on_sale', 'sold_out', 'future_sale', 'past', 'not_on_sale', 'free_no_tickets', 'settings_unavailable', 'unknown', 'error'];
 const UNKNOWN_OUTCOME_SAMPLE_LIMIT = 10;
 const DISCOVERY_EXTERNAL_REQUEST_BUDGET = 45;
-const DISCOVERY_RECHECK_MS = {
+const DEFAULT_DISCOVERY_RECHECK_MS = {
   on_sale: 6 * 60 * 60 * 1000,
   sold_out: 60 * 60 * 1000,
   settings_unavailable: 60 * 60 * 1000,
   unknown: 60 * 60 * 1000,
   error: 30 * 60 * 1000,
 };
+
+export function formatJobDuration(durationMs) {
+  const totalSeconds = Math.max(0, Math.round((Number(durationMs) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+export function getDiscoveryRecheckMs(adapter, outcome) {
+  const configuredMinutes = Number(adapter?.discoveryRecheckMinutes?.[outcome]);
+  if (Number.isInteger(configuredMinutes) && configuredMinutes >= 5 && configuredMinutes <= 24 * 60) {
+    return configuredMinutes * 60 * 1000;
+  }
+  return DEFAULT_DISCOVERY_RECHECK_MS[outcome] ?? null;
+}
+
+export function buildAvailabilityFingerprint(sectionGroups = []) {
+  const normalizedGroups = (Array.isArray(sectionGroups) ? sectionGroups : [])
+    .map(group => ({
+      id: String(group?.sectionGroupId || ''),
+      name: String(group?.sectionGroupName || ''),
+      total: Number(group?.totalAvailableSeats) || 0,
+      zones: (Array.isArray(group?.sectionSeatSummaries) ? group.sectionSeatSummaries : [])
+        .map(summary => ({
+          sectionId: String(summary?.sectionId || ''),
+          zoneId: String(summary?.zoneId || ''),
+          screenId: String(summary?.screenId || ''),
+          availableCount: Number(summary?.availableCount) || 0
+        }))
+        .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+    }))
+    .sort((left, right) => `${left.id}:${left.name}`.localeCompare(`${right.id}:${right.name}`));
+  return JSON.stringify(normalizedGroups);
+}
+
+function withInventoryScanMetadata(inventory, metadata) {
+  Object.defineProperty(inventory, 'scanMetadata', {
+    value: metadata,
+    enumerable: false,
+    configurable: true
+  });
+  return inventory;
+}
 
 function emptyDiscoveryOutcomeCounts() {
   return Object.fromEntries(DISCOVERY_OUTCOMES.map(outcome => [outcome, 0]));
@@ -27,15 +70,16 @@ export function isProductionDueForDiscovery(production, schedule, nowMs) {
   return !Number.isFinite(nextCheckMs) || nextCheckMs <= nowMs;
 }
 
-function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs, buyButton = {}) {
+function scheduleProductionRecheck(schedule, production, outcome, checkedAtMs, buyButton = {}, adapter = null) {
   let nextCheckAt = null;
   if (outcome === 'future_sale') {
     const saleStartMs = Date.parse(buyButton?.MOSStartDate || '');
     nextCheckAt = Number.isFinite(saleStartMs) && saleStartMs > checkedAtMs
       ? new Date(saleStartMs).toISOString()
       : new Date(checkedAtMs + (24 * 60 * 60 * 1000)).toISOString();
-  } else if (Object.hasOwn(DISCOVERY_RECHECK_MS, outcome)) {
-    nextCheckAt = new Date(checkedAtMs + DISCOVERY_RECHECK_MS[outcome]).toISOString();
+  } else {
+    const recheckMs = getDiscoveryRecheckMs(adapter, outcome);
+    if (recheckMs) nextCheckAt = new Date(checkedAtMs + recheckMs).toISOString();
   }
   const subItemStatusCounts = (Array.isArray(buyButton?.SubItems) ? buyButton.SubItems : [])
     .reduce((counts, item) => {
@@ -271,6 +315,7 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     const sectionPayload = await executeSecureFetch(env, sectionAvailabilityUrl, targetRow, { method: 'GET', apiRequest: true, redirect: 'manual', inventoryEndpoint: 'section_availability' });
     const sectionGroups = parseInventoryApiPayload(sectionPayload, '[]', 'section_availability');
     if (!Array.isArray(sectionGroups)) throw new Error('section_availability returned an unexpected JSON shape.');
+    const availabilityFingerprint = buildAvailabilityFingerprint(sectionGroups);
     const activeSectionGroups = sectionGroups.filter(group => {
       const total = Number(group?.totalAvailableSeats);
       if (Number.isFinite(total)) return total > 0;
@@ -282,7 +327,35 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     });
     if (!activeSectionGroups.length) {
       console.log(`[PARSER] Performance ${performanceId} has no available sections; skipping detail endpoints.`);
-      return [];
+      return withInventoryScanMetadata([], {
+        availabilityOnly: true,
+        availabilityState: 'sold_out',
+        availableItemCount: 0,
+        availabilityFingerprint
+      });
+    }
+
+    const totalAvailableSeats = activeSectionGroups.reduce((total, group) => {
+      const groupTotal = Number(group?.totalAvailableSeats);
+      if (Number.isFinite(groupTotal)) return total + Math.max(0, groupTotal);
+      return total + (Array.isArray(group?.sectionSeatSummaries)
+        ? group.sectionSeatSummaries.reduce((sum, summary) => sum + Math.max(0, Number(summary?.availableCount) || 0), 0)
+        : 0);
+    }, 0);
+    // A prior available baseline with the identical availability summary has
+    // not changed in any way that could yield a new candidate or a drop.
+    // Keep the poll lightweight; a sold-out -> available transition never
+    // takes this path and will always get a complete seat scan.
+    if (targetRow.inventory_availability_state === 'available'
+      && targetRow.last_availability_fingerprint
+      && targetRow.last_availability_fingerprint === availabilityFingerprint) {
+      console.log(`[PARSER] Performance ${performanceId} availability is unchanged; skipping price and seat detail endpoints.`);
+      return withInventoryScanMetadata([], {
+        availabilityOnly: true,
+        availabilityState: 'available',
+        availableItemCount: totalAvailableSeats,
+        availabilityFingerprint
+      });
     }
 
     // Section availability normally supplies the display name. Only use the
@@ -330,9 +403,27 @@ export async function segerstromDrillDownStrategy(targetRow, _htmlBody, env, ctx
     // Pass the combined seat and price data to the final parser.
     const finalPayload = { seats: allSeatData, prices: zonePriceMap };
     const parser = VENUE_PARSERS[targetRow.venue_id];
-    return parser(JSON.stringify(finalPayload), targetRow.venue_id)
+    const inventory = parser(JSON.stringify(finalPayload), targetRow.venue_id)
       .map(item => ({ ...item, eventId: String(targetRow.event_id || performanceId) }));
+    return withInventoryScanMetadata(inventory, {
+      availabilityOnly: false,
+      availabilityState: 'available',
+      availableItemCount: totalAvailableSeats,
+      availabilityFingerprint
+    });
   } catch (err) {
+    if (err?.code === 'SUBREQUEST_BUDGET_EXHAUSTED') {
+      // The all-events job owns the checkpoint/requeue decision. Do not emit
+      // a false API-failure error for this intentional invocation boundary.
+      console.log(`[PARSER] Request budget reached during performance ${performanceId}; deferring remaining seat-map work.`);
+      throw err;
+    }
+    if (err?.code === 'VENUE_VALIDATION_CHALLENGE') {
+      // The inventory job's shared recovery handler performs the checkpoint,
+      // cooldown, and single operational alert. Avoid mislabeling this as a
+      // malformed endpoint response.
+      throw err;
+    }
     console.error(`[PARSER - ${adapter.venueName}] Failed during API fetch for performanceId ${performanceId}: ${err.message}`);
     throw err;
   }
@@ -432,7 +523,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       productionQueue: [{ id: productionId, title: String(singleProduction.title || `Production ${productionId}`), calendarVenueHall }],
       processedIds: [], totalEventsDiscovered: 0, totalProductions: 1,
       processedProductions: 0, remainingProductions: 1, complete: false,
-      lastUpdatedAt: new Date().toISOString(), productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
+      startedAt: new Date().toISOString(), lastUpdatedAt: new Date().toISOString(), productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
       unknownOutcomeSamples: [], runCount: 0,
     };
     initialQueueSize = 1;
@@ -499,6 +590,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       processedProductions: 0,
       remainingProductions: productionQueue.length,
       complete: false,
+      startedAt: new Date().toISOString(),
       lastUpdatedAt: new Date().toISOString(),
       productionOutcomeCounts: emptyDiscoveryOutcomeCounts(),
       unknownOutcomeSamples: [],
@@ -519,6 +611,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       ? jobState.unknownOutcomeSamples.slice(0, UNKNOWN_OUTCOME_SAMPLE_LIMIT)
       : [];
     jobState.runCount = Number(jobState.runCount) || 0;
+    jobState.startedAt = jobState.startedAt || jobState.lastUpdatedAt || new Date().toISOString();
     console.log(`[PARSER] Resuming discovery job with ${jobState.productionQueue.length} productions remaining.`);
   }
 
@@ -536,6 +629,15 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     jobState.remainingProductions = jobState.productionQueue.length;
     jobState.complete = true;
     jobState.lastUpdatedAt = new Date().toISOString();
+    const jobElapsedMs = Date.now() - new Date(jobState.startedAt || jobState.lastUpdatedAt || Date.now()).getTime();
+    console.log('[DISCOVERY JOB TIMER] Complete', {
+      venueId: targetRow.venue_id,
+      jobRunCount: jobState.runCount || 0,
+      processedProductions: jobState.processedProductions,
+      elapsedMs: jobElapsedMs,
+      elapsed: formatJobDuration(jobElapsedMs),
+      noDueProductions: true
+    });
     console.log(`[PARSER] Discovery job complete. All productions processed. totalCompleted=${jobState.processedProductions}, totalRemaining=0, totalQueued=${jobState.productionQueue.length}, totalKnown=${jobState.totalProductions || jobState.processedProductions}, totalRuns=${jobState.runCount || 0}`);
     trackWorkerLog(env, ctx, 'info', `[PARSER - ${adapter.venueName}] Discovery job finished. A total of ${jobState.totalEventsDiscovered} events were discovered.`, {
       finalEventCount: jobState.totalEventsDiscovered,
@@ -697,6 +799,18 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
       )];
       const onSalePerformanceIds = new Set(onSalePerformanceIdList);
       productionOutcome = classifyDiscoveryOutcome(buyButton, onSalePerformanceIds);
+      await recordDiscoveredEventOutcomes(env.DB, (buyButton?.SubItems || []).map(item => {
+        const status = String(item?.Status || '').toLowerCase();
+        return {
+          eventId: item?.ItemId,
+          sourceProductionId: productionSeasonId,
+          outcome: status === 'onsale' ? 'on_sale'
+            : status === 'soldout' ? 'sold_out'
+            : status === 'pastsale' ? 'past'
+            : status === 'notonsale' ? 'not_on_sale'
+            : status === 'freenotixs' ? 'free_no_tickets' : 'unknown'
+        };
+      }), batchStartedAtIso);
       const currentSoldOutPerformances = getCurrentSoldOutPerformances(buyButton);
       for (const performance of currentSoldOutPerformances) {
         const performanceId = normalizeExternalId(performance.ItemId);
@@ -707,6 +821,8 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
           showtime: new Date(showtimeMs).toISOString(),
           eventId: performanceId,
           venueId: targetRow.venue_id,
+          sourceProductionId: productionSeasonId,
+          discoveryOutcome: 'sold_out',
           venueHall: calendarVenueHall,
           eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', performanceId)
         });
@@ -786,9 +902,11 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
               allDiscoveredEvents.push({
                 showName: p.description || `Performance ${p.performanceId}`,
                 showtime: p.performanceDate.replace('T', ' '),
-                eventId: normalizeExternalId(p.performanceId),
-                venueId: targetRow.venue_id,
-                venueHall: calendarVenueHall || resolveVenueHall(p, settingsData),
+              eventId: normalizeExternalId(p.performanceId),
+              venueId: targetRow.venue_id,
+              sourceProductionId: productionSeasonId,
+              discoveryOutcome: 'on_sale',
+              venueHall: calendarVenueHall || resolveVenueHall(p, settingsData),
                 eventDetailUrl: adapter.ticketingUrlTemplate?.replace('{performanceId}', p.performanceId)
               });
             }
@@ -824,7 +942,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     jobState.productionOutcomeCounts[productionOutcome] += 1;
     jobState.processedIds.push(productionSeasonId);
     processedThisRun.push(productionSeasonId);
-    if (!singleProduction) scheduleProductionRecheck(productionSchedule, productionToProcess, productionOutcome, Date.now(), buyButton);
+    if (!singleProduction) scheduleProductionRecheck(productionSchedule, productionToProcess, productionOutcome, Date.now(), buyButton, adapter);
   }
 
   // Persist events before checkpointing the queue. If persistence fails, the
@@ -842,6 +960,7 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
   if (!singleProduction) await setDiscoveryProductionSchedule(env.DB, targetRow.venue_id, productionSchedule);
 
   const batchDurationMs = Date.now() - batchStartedAt;
+  const jobElapsedMs = Date.now() - new Date(jobState.startedAt).getTime();
   const batchCompletedAtIso = new Date().toISOString();
   const averageMsPerProduction = processedThisRun.length
     ? Math.round(batchDurationMs / processedThisRun.length)
@@ -853,6 +972,8 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     insertedEvents: upsertResult.inserted,
     soldOutEventsEnrolled,
     durationMs: batchDurationMs,
+    jobElapsedMs,
+    jobElapsed: formatJobDuration(jobElapsedMs),
     averageMsPerProduction,
     outcomes: batchOutcomeCounts,
     unknownOutcomeSamples: unknownOutcomeSamplesInRun,
@@ -920,6 +1041,13 @@ async function segerstromProductionDiscoveryStrategyImpl(targetRow, _htmlBody, e
     sendDiscoveryStatusToTelegram(env, ctx, adapter.venueName, jobState, upsertResult.inserted || 0, allDiscoveredEvents.length, batchDurationMs);
   }
   if (jobState.complete) {
+    console.log('[DISCOVERY JOB TIMER] Complete', {
+      venueId: targetRow.venue_id,
+      jobRunCount: jobState.runCount,
+      processedProductions: jobState.processedProductions,
+      elapsedMs: jobElapsedMs,
+      elapsed: formatJobDuration(jobElapsedMs)
+    });
     console.log(`[PARSER] Discovery job complete. All ${jobState.processedProductions} productions processed in ${jobState.runCount} run(s); ${jobState.totalEventsDiscovered} new events discovered.`, {
       outcomes: jobState.productionOutcomeCounts,
       unknownOutcomeSamples: jobState.unknownOutcomeSamples
@@ -1007,7 +1135,7 @@ export async function algoliaDiscoveryStrategy(targetRow, _htmlBody, env, ctx, e
     const algoliaUrl = `https://${algoliaAppId}-dsn.algolia.net/1/indexes/${algoliaIndexName}/query`;
     const algoliaPayload = { params: 'hitsPerPage=100&filters=ExcludeFromCalendar:false AND ItemType:Production' };
 
-    // This is a direct, server-to-server API call. It does not need to go through the ZenRows proxy.
+    // This is a direct, server-to-server API call and does not use the SeatMe session flow.
     const response = await executeApiFetch(algoliaUrl, { method: 'POST', body: JSON.stringify(algoliaPayload), headers: { 'Content-Type': 'application/json', 'X-Algolia-Application-Id': algoliaAppId, 'X-Algolia-API-Key': algoliaApiKey } });
     const searchResults = JSON.parse(response.text || '{}');
     const allDiscoveredEvents = [];
