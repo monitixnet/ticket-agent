@@ -68,6 +68,7 @@ export async function recordDiscoveryBatchMetric(db, metric) {
 const GET_NEXT_EVENT_TO_SCAN_SQL = `
   SELECT e.id as event_id, e.showtime, e.event_url, e.venue_hall, e.venue_hall_id,
     s.show_name, v.id as venue_id, v.name as venue_name, v.state_code, v.timezone_name, v.security_tier,
+    vh.capacity AS mapped_capacity_seat_count,
     eis.availability_state AS inventory_availability_state,
     eis.availability_fingerprint AS last_availability_fingerprint,
     eis.last_availability_checked_at,
@@ -75,6 +76,7 @@ const GET_NEXT_EVENT_TO_SCAN_SQL = `
   FROM events e
   JOIN shows s ON e.show_id = s.id
   JOIN venues v ON s.venue_id = v.id
+  LEFT JOIN venue_halls vh ON vh.id = e.venue_hall_id
   LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
 `;
 
@@ -173,35 +175,82 @@ export async function persistInventoryCandidates(db, snapshot = {}) {
 // opted that exact show into monitoring. The explicit-rule branch repairs
 // legacy/stale discovery rows (such as Phantom) without admitting arbitrary
 // unknown events into the drop lane.
-export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityIntervals = {}) {
+export async function getDueDropWatchEvents(db, venueId, limit = 6, priorityIntervals = {}, availabilityPriorityPolicy = {}) {
   const intervals = {
     critical: Math.max(5, Number(priorityIntervals.critical) || 5),
     high: Math.max(5, Number(priorityIntervals.high) || 10),
     medium: Math.max(5, Number(priorityIntervals.medium) || 30),
     low: Math.max(5, Number(priorityIntervals.low) || 60)
   };
+  const policyEnabled = availabilityPriorityPolicy.enabled === true || availabilityPriorityPolicy.enabled === 1;
+  const criticalMaxAvailableBasisPoints = Math.max(0, Math.min(10_000,
+    Number(availabilityPriorityPolicy.criticalMaxAvailableBasisPoints) || 1000));
+  const lowMinAvailableBasisPoints = Math.max(0, Math.min(10_000,
+    Number(availabilityPriorityPolicy.lowMinAvailableBasisPoints) || 8000));
   const result = await db.prepare(`SELECT e.id as event_id, e.showtime, e.event_url, e.venue_hall, e.venue_hall_id,
       s.show_name, v.id as venue_id, v.name as venue_name, v.state_code, v.timezone_name, v.security_tier,
+      vh.capacity AS mapped_capacity_seat_count,
       wr.max_price_cents AS drop_watch_max_price_cents,
-      COALESCE(wr.priority, 'medium') AS drop_watch_priority,
+      CASE
+        WHEN eis.availability_state = 'sold_out' AND wr.priority IS NOT NULL THEN wr.priority
+        WHEN eis.availability_state = 'sold_out' THEN 'medium'
+        WHEN ? = 1 AND eis.availability_state = 'available'
+          AND eis.available_percentage_basis_points <= ? THEN 'critical'
+        WHEN ? = 1 AND eis.availability_state = 'available'
+          AND eis.available_percentage_basis_points >= ? THEN 'low'
+        ELSE 'medium'
+      END AS drop_watch_priority,
       eis.availability_state AS inventory_availability_state,
+      eis.available_percentage_basis_points,
+      eis.capacity_seat_count,
       eis.availability_fingerprint AS last_availability_fingerprint,
       eis.last_availability_checked_at,
       eis.last_deep_scan_at
     FROM events e JOIN shows s ON e.show_id = s.id JOIN venues v ON s.venue_id = v.id
+    LEFT JOIN venue_halls vh ON vh.id = e.venue_hall_id
     LEFT JOIN inventory_watch_rules wr
       ON wr.venue_id = v.id AND wr.show_name = s.show_name AND wr.enabled = 1
     LEFT JOIN event_inventory_state eis ON eis.event_id = e.id
     WHERE v.id = ? AND e.showtime >= datetime('now')
-      AND eis.availability_state = 'sold_out'
-      AND (e.discovery_outcome = 'sold_out' OR wr.id IS NOT NULL)
+      AND (
+        (eis.availability_state = 'sold_out' AND (e.discovery_outcome = 'sold_out' OR wr.id IS NOT NULL))
+        OR (? = 1 AND eis.availability_state = 'available' AND e.discovery_outcome = 'on_sale'
+          AND eis.available_percentage_basis_points IS NOT NULL
+          AND (eis.available_percentage_basis_points <= ? OR eis.available_percentage_basis_points >= ?))
+      )
       AND (eis.last_observed_at IS NULL
-        OR datetime(eis.last_observed_at, '+' || CASE COALESCE(wr.priority, 'medium')
-          WHEN 'critical' THEN ? WHEN 'high' THEN ? WHEN 'low' THEN ? ELSE ? END || ' minutes') <= datetime('now'))
-    ORDER BY CASE COALESCE(wr.priority, 'medium')
+        OR datetime(eis.last_observed_at, '+' || CASE
+          WHEN (eis.availability_state = 'sold_out' AND wr.priority = 'critical')
+            OR (? = 1 AND eis.availability_state = 'available'
+              AND eis.available_percentage_basis_points <= ?) THEN ?
+          WHEN eis.availability_state = 'sold_out' AND wr.priority = 'high' THEN ?
+          WHEN (eis.availability_state = 'sold_out' AND wr.priority = 'low')
+            OR (? = 1 AND eis.availability_state = 'available'
+              AND eis.available_percentage_basis_points >= ?) THEN ?
+          ELSE ? END || ' minutes') <= datetime('now'))
+    ORDER BY CASE
+      WHEN eis.availability_state = 'sold_out' AND wr.priority IS NOT NULL THEN wr.priority
+      WHEN eis.availability_state = 'sold_out' THEN 'medium'
+      WHEN ? = 1 AND eis.availability_state = 'available'
+        AND eis.available_percentage_basis_points <= ? THEN 'critical'
+      WHEN ? = 1 AND eis.availability_state = 'available'
+        AND eis.available_percentage_basis_points >= ? THEN 'low'
+      ELSE 'medium'
+      END
       WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
       eis.last_observed_at ASC, e.showtime ASC
-    LIMIT ?`).bind(venueId, intervals.critical, intervals.high, intervals.low, intervals.medium,
+    LIMIT ?`).bind(
+      policyEnabled ? 1 : 0, criticalMaxAvailableBasisPoints,
+      policyEnabled ? 1 : 0, lowMinAvailableBasisPoints,
+      venueId, policyEnabled ? 1 : 0, criticalMaxAvailableBasisPoints, lowMinAvailableBasisPoints,
+      policyEnabled ? 1 : 0, criticalMaxAvailableBasisPoints,
+      policyEnabled ? 1 : 0, lowMinAvailableBasisPoints,
+      policyEnabled ? 1 : 0, criticalMaxAvailableBasisPoints, intervals.critical,
+      intervals.high,
+      policyEnabled ? 1 : 0, lowMinAvailableBasisPoints, intervals.low,
+      intervals.medium,
+      policyEnabled ? 1 : 0, criticalMaxAvailableBasisPoints,
+      policyEnabled ? 1 : 0, lowMinAvailableBasisPoints,
       Math.max(1, Math.min(48, Number(limit) || 6))).all();
   return result?.results || [];
 }
@@ -250,6 +299,13 @@ export function clearDropWatchHealthAlertState(db, venueId) {
 export async function recordInventoryAvailabilityObservation(db, observation = {}) {
   if (!db || !observation.eventId || !observation.scanId || !observation.observedAt) return { dropDetected: false };
   const availableItemCount = Math.max(0, Number(observation.availableItemCount) || 0);
+  const alertEligibleItemCount = Math.max(0, Number(
+    observation.alertEligibleItemCount ?? availableItemCount
+  ) || 0);
+  const capacitySeatCount = Number.isInteger(Number(observation.capacitySeatCount)) && Number(observation.capacitySeatCount) > 0
+    ? Number(observation.capacitySeatCount) : null;
+  const availablePercentageBasisPoints = capacitySeatCount === null ? null
+    : Math.min(10_000, Math.round((availableItemCount * 10_000) / capacitySeatCount));
   const nextState = availableItemCount > 0 ? 'available' : 'sold_out';
   const nextDiscoveryOutcome = nextState === 'available' ? 'on_sale' : 'sold_out';
   const alertId = observation.alertId || `${observation.scanId}:drop`;
@@ -262,11 +318,12 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
       WHERE event_id = ? AND availability_state = 'sold_out' AND ? > 0`)
       .bind(alertId, observation.eventId, observation.scanId, payload,
         observation.observedAt, observation.observedAt, observation.observedAt,
-        observation.eventId, availableItemCount),
+        observation.eventId, alertEligibleItemCount),
     db.prepare(`INSERT INTO event_inventory_state (
       event_id, availability_state, available_item_count, last_scan_id, last_observed_at,
-      availability_fingerprint, last_availability_checked_at, last_deep_scan_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      availability_fingerprint, last_availability_checked_at, last_deep_scan_at,
+      capacity_seat_count, available_percentage_basis_points, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_id) DO UPDATE SET
       availability_state = excluded.availability_state,
       available_item_count = excluded.available_item_count,
@@ -275,10 +332,13 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
       availability_fingerprint = excluded.availability_fingerprint,
       last_availability_checked_at = excluded.last_availability_checked_at,
       last_deep_scan_at = COALESCE(excluded.last_deep_scan_at, event_inventory_state.last_deep_scan_at),
+      capacity_seat_count = excluded.capacity_seat_count,
+      available_percentage_basis_points = excluded.available_percentage_basis_points,
       updated_at = excluded.updated_at`)
       .bind(observation.eventId, nextState, availableItemCount, observation.scanId,
         observation.observedAt, observation.availabilityFingerprint || null,
-        observation.observedAt, observation.deepScanAt || null, observation.observedAt),
+        observation.observedAt, observation.deepScanAt || null,
+        capacitySeatCount, availablePercentageBasisPoints, observation.observedAt),
     // A successful SeatMe availability response is stronger and fresher than
     // an old discovery classification for a future performance. Synchronize
     // the inventory-derived outcome so it remains eligible for the correct
@@ -293,7 +353,9 @@ export async function recordInventoryAvailabilityObservation(db, observation = {
     dropDetected: inserted === 1,
     alertId: inserted === 1 ? alertId : null,
     availabilityState: nextState,
-    discoveryOutcome: nextDiscoveryOutcome
+    discoveryOutcome: nextDiscoveryOutcome,
+    capacitySeatCount,
+    availablePercentageBasisPoints
   };
 }
 

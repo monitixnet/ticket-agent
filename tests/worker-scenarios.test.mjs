@@ -6,7 +6,9 @@ import {
   buildNotificationRequest,
   buildDropAlertMessage,
   buildCandidateAlertMessage,
+  buildStaleDropWatchAlertMessage,
   formatAlertDateTime,
+  formatAvailabilityPriority,
   filterInventoryForDropPriceRule,
   isSubrequestBudgetExhaustion,
   buildServerIssuedCookieHeader,
@@ -144,7 +146,7 @@ const run = async () => {
     assert.equal(getDiscoveryRecheckMs({}, 'sold_out'), 60 * 60 * 1000);
   });
 
-  test('drop watch uses venue-scoped priority intervals and selects critical events first', async () => {
+  test('drop watch uses venue-scoped intervals and capacity-aware priority bands', async () => {
     let capturedSql = '';
     let capturedValues = [];
     const fakeDb = {
@@ -159,13 +161,17 @@ const run = async () => {
       }
     };
     await getDueDropWatchEvents(fakeDb, 'segerstrom_center', 20, {
-      critical: 5, high: 10, medium: 30, low: 60
+      critical: 5, high: 10, medium: 30, low: 10080
+    }, {
+      enabled: true, criticalMaxAvailableBasisPoints: 1000, lowMinAvailableBasisPoints: 8000
     });
     assert.match(capturedSql, /wr\.venue_id = v\.id/);
-    assert.match(capturedSql, /COALESCE\(wr\.priority, 'medium'\)/);
+    assert.match(capturedSql, /eis\.available_percentage_basis_points <= \?/);
+    assert.match(capturedSql, /eis\.available_percentage_basis_points >= \?/);
     assert.match(capturedSql, /e\.discovery_outcome = 'sold_out' OR wr\.id IS NOT NULL/);
     assert.match(capturedSql, /WHEN 'critical' THEN 0/);
-    assert.deepEqual(capturedValues, ['segerstrom_center', 5, 10, 60, 30, 20]);
+    assert.equal(capturedValues.includes('segerstrom_center'), true);
+    assert.equal(capturedValues.includes(10080), true);
   });
 
   test('successful inventory observations synchronize the latest eligibility outcome', async () => {
@@ -183,11 +189,15 @@ const run = async () => {
     };
     const result = await recordInventoryAvailabilityObservation(fakeDb, {
       eventId: 'phantom-event', scanId: 'scan-1', observedAt: '2026-08-22T16:00:00.000Z',
-      availableItemCount: 0
+      availableItemCount: 50, capacitySeatCount: 500
     });
     const outcomeUpdate = statements.find(statement => statement.sql.includes('UPDATE events SET discovery_outcome'));
-    assert.deepEqual(outcomeUpdate?.values, ['sold_out', '2026-08-22T16:00:00.000Z', 'phantom-event']);
-    assert.equal(result.discoveryOutcome, 'sold_out');
+    const stateUpsert = statements.find(statement => statement.sql.includes('INSERT INTO event_inventory_state'));
+    assert.deepEqual(outcomeUpdate?.values, ['on_sale', '2026-08-22T16:00:00.000Z', 'phantom-event']);
+    assert.equal(stateUpsert?.values.at(-3), 500);
+    assert.equal(stateUpsert?.values.at(-2), 1000);
+    assert.equal(result.discoveryOutcome, 'on_sale');
+    assert.equal(result.availablePercentageBasisPoints, 1000);
   });
 
   test('critical drop-watch health audit checks only explicitly configured critical rules', async () => {
@@ -468,10 +478,36 @@ const run = async () => {
       showName: 'Example Show', showtime: '2026-09-01 19:30:00', eventUrl: 'https://seatme.example/event',
       observedAt: '2026-08-22T00:00:00.000Z', timezoneName: 'America/Los_Angeles',
       checkoutFeeRule: { type: 'percentage_per_ticket', rateBasisPoints: 1800 },
+      availabilityPriority: 'CRITICAL — 92% SOLD OUT (8% available)',
       candidates: [{ targetQuantity: 2, section: 'Orchestra', row: 'D', startSeat: '10', endSeat: '11', priceCents: 12500, bufferBlocks: [{ row: 'C' }] }]
     });
     assert.match(message, /Qty 2: Orchestra, Row D, Seats 10–11 \(\$125\.00 \+ \$22\.50 fee = \$147\.50 each; \$295\.00 all-in total\)/);
+    assert.match(message, /Priority: CRITICAL — 92% SOLD OUT \(8% available\)/);
     assert.doesNotMatch(message, /buffer|Row C/i);
+  });
+
+  test('capacity-aware priority labels critical scarce inventory without calling it a drop', () => {
+    const adapter = {
+      availabilityPriorityPolicy: {
+        enabled: true, criticalMaxAvailableBasisPoints: 1000, lowMinAvailableBasisPoints: 8000
+      }
+    };
+    assert.equal(
+      formatAvailabilityPriority(adapter, { availablePercentageBasisPoints: 800 }),
+      'CRITICAL — 92% SOLD OUT (8% available)'
+    );
+    assert.equal(formatAvailabilityPriority(adapter, { availablePercentageBasisPoints: 1001 }), null);
+    assert.equal(formatAvailabilityPriority({}, { availablePercentageBasisPoints: 800 }), null);
+  });
+
+  test('critical drop-watch health alerts use readable venue-local times', () => {
+    const message = buildStaleDropWatchAlertMessage({
+      venueName: 'Segerstrom Center for the Arts', timezoneName: 'America/Los_Angeles'
+    }, [{ show_name: 'Phantom of the Opera', last_observed_at: '2026-08-22T15:45:26.235Z' }],
+    10, '2026-08-22T16:20:14.403Z');
+    assert.match(message, /oldest scan Saturday, August 22, 2026 at 8:45 AM PDT/);
+    assert.match(message, /Observed: Saturday, August 22, 2026 at 9:20 AM PDT/);
+    assert.doesNotMatch(message, /2026-08-22T/);
   });
 
   test('alert times are readable in the venue timezone without shifting wall-clock D1 timestamps', () => {

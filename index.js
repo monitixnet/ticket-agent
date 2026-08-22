@@ -376,6 +376,21 @@ export function formatAlertDateTime(value, timeZone = 'America/Los_Angeles') {
   return zoneName ? `${display} ${zoneName}` : display;
 }
 
+export function formatAvailabilityPriority(adapter, observation = {}) {
+  const policy = adapter?.availabilityPriorityPolicy || {};
+  if (!(policy.enabled === true || policy.enabled === 1)) return null;
+  const availableBps = Number(observation.availablePercentageBasisPoints);
+  if (!Number.isFinite(availableBps) || availableBps < 0 || availableBps > 10_000) return null;
+  const criticalMax = Number(policy.criticalMaxAvailableBasisPoints);
+  if (!Number.isFinite(criticalMax) || availableBps > criticalMax) return null;
+  const formatPercent = basisPoints => {
+    const percent = basisPoints / 100;
+    return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, '');
+  };
+  const soldOutBps = 10_000 - availableBps;
+  return `CRITICAL — ${formatPercent(soldOutBps)}% SOLD OUT (${formatPercent(availableBps)}% available)`;
+}
+
 export function buildDropAlertMessage(payload = {}) {
   const maxPriceCents = normalizeDropPriceCapCents(payload.maxPriceCents);
   const priceRule = maxPriceCents !== null
@@ -402,6 +417,7 @@ export function buildDropAlertMessage(payload = {}) {
     `Hall: ${payload.venueHall || 'unresolved'}`,
     `Show: ${payload.showName}`,
     `Performance: ${formatAlertDateTime(payload.showtime, payload.timezoneName)}`,
+    ...(payload.availabilityPriority ? [`Priority: ${payload.availabilityPriority}`] : []),
     `Event ID: ${payload.eventId}`,
     `Eligible seats detected: ${payload.availableItemCount} (${priceRange})`,
     priceRule,
@@ -431,6 +447,7 @@ export function buildCandidateAlertMessage(payload = {}) {
     `Hall: ${payload.venueHall || 'unresolved'}`,
     `Show: ${payload.showName}`,
     `Performance: ${formatAlertDateTime(payload.showtime, payload.timezoneName)}`,
+    ...(payload.availabilityPriority ? [`Priority: ${payload.availabilityPriority}`] : []),
     `Candidates:\n${candidateLines}`,
     `Observed: ${formatAlertDateTime(payload.observedAt, payload.timezoneName)}`,
     `Buy: ${payload.eventUrl || 'direct URL unavailable'}`,
@@ -478,7 +495,7 @@ async function deliverPendingCandidateAlerts(env, limit = 10) {
   return alerts.length;
 }
 
-function buildStaleDropWatchAlertMessage(adapter, staleEvents, staleAfterMinutes, observedAt) {
+export function buildStaleDropWatchAlertMessage(adapter, staleEvents, staleAfterMinutes, observedAt) {
   const byShow = new Map();
   for (const event of staleEvents) {
     const showName = event.show_name || 'Unknown show';
@@ -490,14 +507,15 @@ function buildStaleDropWatchAlertMessage(adapter, staleEvents, staleAfterMinutes
     byShow.set(showName, group);
   }
   const details = [...byShow.entries()]
-    .map(([showName, group]) => `${showName}: ${group.count} performance(s), oldest scan ${group.oldest}`)
+    .map(([showName, group]) => `${showName}: ${group.count} performance(s), oldest scan ${group.oldest === 'never'
+      ? 'never' : formatAlertDateTime(group.oldest, adapter.timezoneName)}`)
     .join('\n');
   return [
     '⚠️ CRITICAL DROP WATCH STALE',
     `Venue: ${adapter.venueName}`,
     `No successful inventory observation within ${staleAfterMinutes} minutes:`,
     details,
-    `Observed: ${observedAt}`,
+    `Observed: ${formatAlertDateTime(observedAt, adapter.timezoneName)}`,
     'Action: Check Worker logs and venue access before relying on drop alerts.'
   ].join('\n');
 }
@@ -895,8 +913,11 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
           ))
           : [];
         inventoryCandidates = candidates;
-        const observedAvailableItemCount = availabilityOnly
-          ? Math.max(0, Number(availabilityMetadata.availableItemCount) || 0)
+        // The section-availability endpoint is the authoritative event-level
+        // count. Deep parsing can intentionally omit unmapped seats, so it
+        // must never change the availability ratio or sold-out state.
+        const observedAvailableItemCount = Number.isFinite(Number(availabilityMetadata?.availableItemCount))
+          ? Math.max(0, Number(availabilityMetadata.availableItemCount))
           : inventory.length;
         const persistedSnapshot = await persistInventoryCandidates(env.DB, {
           scanId,
@@ -914,6 +935,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
         });
         let dropObservation = null;
         let candidateObservation = null;
+        let availabilityPriority = null;
         {
           const maxPriceCents = normalizeDropPriceCapCents(targetRow.drop_watch_max_price_cents);
           const qualifyingInventory = availabilityOnly ? [] : filterInventoryForDropPriceRule(inventory, maxPriceCents);
@@ -922,6 +944,11 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             .filter(Number.isFinite);
           const eligibleCandidateBlocks = candidates.filter(candidate => maxPriceCents == null
             || (Number.isFinite(Number(candidate.priceCents)) && Number(candidate.priceCents) <= maxPriceCents));
+          const mappedCapacitySeatCount = Number(targetRow.mapped_capacity_seat_count);
+          const availablePercentageBasisPoints = Number.isInteger(mappedCapacitySeatCount) && mappedCapacitySeatCount > 0
+            ? Math.min(10_000, Math.round((observedAvailableItemCount * 10_000) / mappedCapacitySeatCount))
+            : null;
+          availabilityPriority = formatAvailabilityPriority(adapter, { availablePercentageBasisPoints });
           const dropPayload = {
             eventId: targetRow.event_id,
             venueName: targetRow.venue_name,
@@ -942,6 +969,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
               .slice(0, 4)
               .map(item => ({ section: item.section, row: item.row, seat: item.seat, priceCents: item.priceCents })),
             eligibleCandidateBlocks: eligibleCandidateBlocks.slice(0, 3),
+            availabilityPriority,
             observedAt: timestampIsoString
           };
           dropObservation = await recordInventoryAvailabilityObservation(env.DB, {
@@ -951,7 +979,9 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             // An availability-only poll is possible only after an available
             // baseline with an identical fingerprint. Preserve that state
             // instead of incorrectly treating its empty detail list as sold out.
-            availableItemCount: availabilityOnly ? observedAvailableItemCount : qualifyingInventory.length,
+            availableItemCount: observedAvailableItemCount,
+            alertEligibleItemCount: qualifyingInventory.length,
+            capacitySeatCount: targetRow.mapped_capacity_seat_count,
             observedAt: timestampIsoString,
             availabilityFingerprint: availabilityMetadata?.availabilityFingerprint || null,
             deepScanAt: availabilityOnly ? null : timestampIsoString,
@@ -962,8 +992,10 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
             eventId: targetRow.event_id,
             showName: targetRow.show_name,
             availabilityState: dropObservation.availabilityState,
-            availableItemCount: availabilityOnly ? observedAvailableItemCount : qualifyingInventory.length,
+            availableItemCount: observedAvailableItemCount,
             observedAvailableItemCount,
+            mappedCapacitySeatCount: targetRow.mapped_capacity_seat_count || null,
+            availablePercentageBasisPoints: dropObservation.availablePercentageBasisPoints,
             maxPriceCents,
             dropDetected: dropObservation.dropDetected
           });
@@ -1002,6 +1034,7 @@ async function executeScanForTarget(targetRow, env, ctx, options = {}) {
               eventUrl: targetRow.event_url,
               candidates: candidateDigest,
               checkoutFeeRule: adapter.checkoutFeeRule,
+              availabilityPriority,
               observedAt: timestampIsoString
             }
           });
@@ -1308,7 +1341,7 @@ async function runInventoryJobForVenue(adapter, env, ctx, now) {
 // an alertable drop. Candidate blocks and resale buffer rules do not apply.
 async function runDropWatchForVenue(adapter, env, ctx, now) {
   const targets = await getDueDropWatchEvents(env.DB, adapter.venueId, adapter.dropWatchBatchSize,
-    adapter.dropWatchIntervalsMinutes);
+    adapter.dropWatchIntervalsMinutes, adapter.availabilityPriorityPolicy);
   if (!targets.length) return { attempted: 0, completed: 0, failed: 0 };
 
   console.log(`[DROP WATCH] ${adapter.venueName}: scanning ${targets.length} due performance(s).`, {

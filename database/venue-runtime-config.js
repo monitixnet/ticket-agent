@@ -3,6 +3,12 @@ import { normalizeCheckoutFeeRule } from '../checkout-fees.js';
 
 const SECRET_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const DEFAULT_DROP_WATCH_INTERVALS_MINUTES = Object.freeze({ critical: 5, high: 10, medium: 30, low: 60 });
+const MAX_DROP_WATCH_INTERVAL_MINUTES = 7 * 24 * 60;
+const DEFAULT_AVAILABILITY_PRIORITY_POLICY = Object.freeze({
+  enabled: false,
+  criticalMaxAvailableBasisPoints: 1000,
+  lowMinAvailableBasisPoints: 8000
+});
 
 function parseJson(value, fallback = {}) {
   try { return value ? JSON.parse(value) : fallback; } catch { return fallback; }
@@ -51,8 +57,23 @@ function buildAdapter(row, env) {
   const dropWatchIntervalsMinutes = Object.fromEntries(Object.entries(DEFAULT_DROP_WATCH_INTERVALS_MINUTES)
     .map(([priority, defaultMinutes]) => {
       const value = Number(configuredDropWatchIntervals[priority]);
-      return [priority, Number.isInteger(value) && value >= 5 && value <= 24 * 60 ? value : defaultMinutes];
+      return [priority, Number.isInteger(value) && value >= 5 && value <= MAX_DROP_WATCH_INTERVAL_MINUTES ? value : defaultMinutes];
     }));
+  const configuredAvailabilityPriorityPolicy = config.availabilityPriorityPolicy || {};
+  const criticalMaxAvailableBasisPoints = Number(configuredAvailabilityPriorityPolicy.criticalMaxAvailableBasisPoints);
+  const lowMinAvailableBasisPoints = Number(configuredAvailabilityPriorityPolicy.lowMinAvailableBasisPoints);
+  const availabilityPriorityPolicy = {
+    enabled: configuredAvailabilityPriorityPolicy.enabled === true || configuredAvailabilityPriorityPolicy.enabled === 1,
+    criticalMaxAvailableBasisPoints: Number.isInteger(criticalMaxAvailableBasisPoints)
+      && criticalMaxAvailableBasisPoints >= 0 && criticalMaxAvailableBasisPoints <= 10_000
+      ? criticalMaxAvailableBasisPoints : DEFAULT_AVAILABILITY_PRIORITY_POLICY.criticalMaxAvailableBasisPoints,
+    lowMinAvailableBasisPoints: Number.isInteger(lowMinAvailableBasisPoints)
+      && lowMinAvailableBasisPoints >= 0 && lowMinAvailableBasisPoints <= 10_000
+      ? lowMinAvailableBasisPoints : DEFAULT_AVAILABILITY_PRIORITY_POLICY.lowMinAvailableBasisPoints
+  };
+  if (availabilityPriorityPolicy.lowMinAvailableBasisPoints < availabilityPriorityPolicy.criticalMaxAvailableBasisPoints) {
+    availabilityPriorityPolicy.lowMinAvailableBasisPoints = DEFAULT_AVAILABILITY_PRIORITY_POLICY.lowMinAvailableBasisPoints;
+  }
   const inventoryTargetQuantities = Array.isArray(config.inventoryTargetQuantities)
     ? [...new Set(config.inventoryTargetQuantities.map(Number).filter(value => Number.isInteger(value) && value >= 1 && value <= 10))]
     : [2, 6];
@@ -83,6 +104,7 @@ function buildAdapter(row, env) {
       inventoryExternalRequestBudget,
       dropWatchBatchSize,
       dropWatchIntervalsMinutes,
+      availabilityPriorityPolicy,
       inventoryTargetQuantities: inventoryTargetQuantities.length ? inventoryTargetQuantities : [2, 6]
       ,checkoutFeeRule: normalizeCheckoutFeeRule(config.checkoutFeeRule)
       ,apiFetchProviderPool: providerPool(config.apiFetchProviderPool)
@@ -140,6 +162,7 @@ export function buildPublicVenueSummary(adapter) {
     inventoryExternalRequestBudget: adapter.inventoryExternalRequestBudget,
     dropWatchBatchSize: adapter.dropWatchBatchSize,
     dropWatchIntervalsMinutes: adapter.dropWatchIntervalsMinutes,
+    availabilityPriorityPolicy: adapter.availabilityPriorityPolicy,
     inventoryTargetQuantities: adapter.inventoryTargetQuantities,
     checkoutFeeRule: adapter.checkoutFeeRule
   };
